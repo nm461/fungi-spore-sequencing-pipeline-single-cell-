@@ -3,11 +3,11 @@ Repository containing files/scripts related to the various steps and iteration o
 
 
 
-EXCEL FILE
+EXCEL FILE (pending)
 
 
 
-DOWNLOADING THE BUSCO FUNGI DATABASE
+DOWNLOADING THE BUSCO FUNGI DATABASE (pending)
 
 
 
