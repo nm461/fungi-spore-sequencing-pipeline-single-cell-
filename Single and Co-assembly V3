@@ -1,11 +1,11 @@
 #!/bin/bash
-#$ -N testing27
+#$ -N testing27_run4
 #$ -cwd
 #$ -l h_rt=72:00:00
 #$ -l s_vmem=16G,mem_req=16G
 #$ -pe def_slot 8
-#$ -o $HOME/logs/testing27_run3.log
-#$ -e $HOME/logs/testing27_run3.err
+#$ -o $HOME/logs/testing27_run4.log
+#$ -e $HOME/logs/testing27_run4.err
 
 set -e
 set -x
@@ -15,22 +15,29 @@ LOG_DIR="$HOME/logs"
 mkdir -p "$LOG_DIR"
 
 # --- Define and create output directory ---
-OUT_DIR="$HOME/testing27sample_run3_out"
+OUT_DIR="$HOME/testing27sample_out_run4"
 mkdir -p "$OUT_DIR"
+
+# --- Define results directory ---
+RUN_NAME="run4"
+RESULTS_DIR="$HOME/Results/$RUN_NAME"
+mkdir -p "$RESULTS_DIR/blobtools"
+mkdir -p "$RESULTS_DIR/sourmash"
+mkdir -p "$RESULTS_DIR/busco"
+mkdir -p "$RESULTS_DIR/multiqc"
+mkdir -p "$RESULTS_DIR/kraken"
 
 # --- Define other directories ---
 SIF_DIR="$HOME/sif_images"
 DATA_DIR="$HOME/spore1All/sag/spore_1_sc"
 DB_DIR="$HOME/krakendatabaseAN/kraken_db"
 BUSCO_LINEAGE="$HOME/fungi_odb10"
-BLOBTOOLKIT_DB="$HOME/databases/blobtoolkit/taxdump.tar.gz"
 
 # --- Sanity checks ---
 [ ! -d "$SIF_DIR" ] && echo "Error: SIF_DIR $SIF_DIR does not exist" >&2 && exit 1
 [ ! -d "$DATA_DIR" ] && echo "Error: DATA_DIR $DATA_DIR does not exist" >&2 && exit 1
 [ ! -d "$DB_DIR" ] && echo "Error: DB_DIR $DB_DIR does not exist" >&2 && exit 1
 [ ! -d "$BUSCO_LINEAGE" ] && echo "Error: BUSCO_LINEAGE $BUSCO_LINEAGE does not exist" >&2 && exit 1
-[ ! -f "$BLOBTOOLKIT_DB" ] && echo "Error: BlobTools2 taxdump $BLOBTOOLKIT_DB not found" >&2 && exit 1
 
 # --- Input files ---
 R1="$DATA_DIR/spore_1_sc-00210_1.fastq.gz"
@@ -71,6 +78,10 @@ singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
     --paired "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
     > "$OUT_DIR/kraken_output.txt"
 
+# Copy Kraken outputs to results folder
+cp "$OUT_DIR/kraken_report.txt" "$RESULTS_DIR/kraken/"
+cp "$OUT_DIR/kraken_output.txt" "$RESULTS_DIR/kraken/"
+
 # --- 4. BUSCO assessment on SPAdes assembly ---
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -84,6 +95,9 @@ singularity exec "$SIF_DIR/busco_v6.0.0_cv1.sif" busco \
     -m genome \
     --cpu 2 \
     > "$OUT_DIR/busco_spades.log" 2>&1
+
+# Copy BUSCO outputs to results folder
+cp -r "$OUT_DIR/busco_spades"/* "$RESULTS_DIR/busco/"
 
 # --- 5. Mapping reads back to assembly ---
 singularity exec "$SIF_DIR/bwa.sif" bwa index "$OUT_DIR/spades_out/contigs.fasta"
@@ -116,33 +130,75 @@ singularity exec "$SIF_DIR/busco_v6.0.0_cv1.sif" busco \
     --cpu 2 \
     > "$OUT_DIR/busco_pilon.log" 2>&1
 
+# Copy BUSCO Pilon results
+cp -r "$OUT_DIR/busco_pilon"/* "$RESULTS_DIR/busco/"
+
 # --- 8. MultiQC summary report ---
 singularity exec "$SIF_DIR/multiqc.sif" multiqc "$OUT_DIR" -o "$OUT_DIR/multiqc_report" \
     > "$OUT_DIR/multiqc.log" 2>&1
 
-# --- 9. BlobTools2 contamination check ---
+# Copy MultiQC report to results folder
+cp -r "$OUT_DIR/multiqc_report"/* "$RESULTS_DIR/multiqc/"
+
+echo "Starting BlobTools and Sourmash contamination checks..."
+
+# --- 9. BlobTools2 ---
 BLOB_OUT="$OUT_DIR/contamination_checks/blobtoolkit"
 mkdir -p "$BLOB_OUT"
 
-singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools create \
-    --fasta "$OUT_DIR/spades_out/contigs.fasta" \
-    --taxdump "$BLOBTOOLKIT_DB" \
+ASSEMBLY="$OUT_DIR/pilon_corrected.fasta"
+READS1="$R1"
+READS2="$R2"
+SIF_BLOB="$SIF_DIR/blobtoolkit.sif"
+TAXDUMP="$HOME/databases/blobtoolkit/taxdump.tar.gz"
+
+# Create blobDB
+singularity exec "$SIF_BLOB" blobtools create \
+    --fasta "$ASSEMBLY" \
+    --taxdump "$TAXDUMP" \
     --name spore_1_sc \
     --outdir "$BLOB_OUT"
 
-singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools map \
+# Map reads to assembly
+singularity exec "$SIF_BLOB" blobtools map \
     -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
-    -r "$R1" "$R2" \
-    --outdir "$BLOB_OUT"
+    -r "$READS1" -R "$READS2"
 
-singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools view \
-    -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
-    -o "$BLOB_OUT"
-
-singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools plot \
+# Generate view table
+singularity exec "$SIF_BLOB" blobtools view \
     -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
     -o "$BLOB_OUT"
 
-echo "BlobTools2 run completed successfully."
+# Generate plots
+singularity exec "$SIF_BLOB" blobtools plot \
+    -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
+    -o "$BLOB_OUT"
 
-echo "Pipeline finished successfully."
+# Copy BlobTools outputs to Results folder
+cp -r "$BLOB_OUT"/* "$RESULTS_DIR/blobtools/"
+
+# --- 10. Sourmash ---
+SM_OUT="$OUT_DIR/contamination_checks/sourmash"
+mkdir -p "$SM_OUT"
+SIF_SM="$SIF_DIR/sourmash.sif"
+SM_DB="$HOME/databases/sourmash/fungi/genbank-2022.03-fungi-k21.zip"
+
+# Sketch assembly
+singularity exec "$SIF_SM" sourmash sketch dna \
+    -p k=31,scaled=1000 \
+    -o "$SM_OUT/assembly.sig" \
+    "$ASSEMBLY"
+
+# Gather against database
+singularity exec "$SIF_SM" sourmash gather \
+    "$SM_OUT/assembly.sig" \
+    "$SM_DB" \
+    -o "$SM_OUT/gather_results.csv"
+
+# Copy to Results folder
+cp "$SM_OUT/assembly.sig" "$RESULTS_DIR/sourmash/"
+cp "$SM_OUT/gather_results.csv" "$RESULTS_DIR/sourmash/"
+
+echo "BlobTools and Sourmash contamination checks completed."
+echo "All visualizable/readable outputs are in $RESULTS_DIR."
+
