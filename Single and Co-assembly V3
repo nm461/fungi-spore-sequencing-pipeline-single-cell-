@@ -30,7 +30,7 @@ mkdir -p "$RESULTS_DIR/kraken"
 # --- Define other directories ---
 SIF_DIR="$HOME/sif_images"
 DATA_DIR="$HOME/spore1All/sag/spore_1_sc"
-DB_DIR="$HOME/krakendatabaseAN/kraken_db"
+DB_DIR="$HOME/databases/kraken2_fungi_full"
 BUSCO_LINEAGE="$HOME/fungi_odb10"
 
 # --- Sanity checks ---
