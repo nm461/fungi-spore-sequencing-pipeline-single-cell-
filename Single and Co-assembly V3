@@ -1,0 +1,148 @@
+#!/bin/bash
+#$ -N testing27
+#$ -cwd
+#$ -l h_rt=72:00:00
+#$ -l s_vmem=16G,mem_req=16G
+#$ -pe def_slot 8
+#$ -o $HOME/logs/testing27_run3.log
+#$ -e $HOME/logs/testing27_run3.err
+
+set -e
+set -x
+
+# --- Ensure logs directory exists ---
+LOG_DIR="$HOME/logs"
+mkdir -p "$LOG_DIR"
+
+# --- Define and create output directory ---
+OUT_DIR="$HOME/testing27sample_run3_out"
+mkdir -p "$OUT_DIR"
+
+# --- Define other directories ---
+SIF_DIR="$HOME/sif_images"
+DATA_DIR="$HOME/spore1All/sag/spore_1_sc"
+DB_DIR="$HOME/krakendatabaseAN/kraken_db"
+BUSCO_LINEAGE="$HOME/fungi_odb10"
+BLOBTOOLKIT_DB="$HOME/databases/blobtoolkit/taxdump.tar.gz"
+
+# --- Sanity checks ---
+[ ! -d "$SIF_DIR" ] && echo "Error: SIF_DIR $SIF_DIR does not exist" >&2 && exit 1
+[ ! -d "$DATA_DIR" ] && echo "Error: DATA_DIR $DATA_DIR does not exist" >&2 && exit 1
+[ ! -d "$DB_DIR" ] && echo "Error: DB_DIR $DB_DIR does not exist" >&2 && exit 1
+[ ! -d "$BUSCO_LINEAGE" ] && echo "Error: BUSCO_LINEAGE $BUSCO_LINEAGE does not exist" >&2 && exit 1
+[ ! -f "$BLOBTOOLKIT_DB" ] && echo "Error: BlobTools2 taxdump $BLOBTOOLKIT_DB not found" >&2 && exit 1
+
+# --- Input files ---
+R1="$DATA_DIR/spore_1_sc-00210_1.fastq.gz"
+R2="$DATA_DIR/spore_1_sc-00210_2.fastq.gz"
+[ ! -f "$R1" ] && echo "Error: Input file $R1 not found" >&2 && exit 1
+[ ! -f "$R2" ] && echo "Error: Input file $R2 not found" >&2 && exit 1
+
+# --- Load modules ---
+module use /usr/local/package/modulefiles
+module load apptainer
+
+# --- Load SPAdes into the PATH ---
+export PATH=~/coassembly/bin/SPAdes-4.2.0-Linux/bin:$PATH
+
+echo "All directories and input files verified. Starting pipeline..."
+
+# --- 1. Fastp for read trimming ---
+singularity exec "$SIF_DIR/fastp.sif" fastp \
+    -i "$R1" -I "$R2" \
+    -o "$OUT_DIR/trimmed_R1.fastq.gz" \
+    -O "$OUT_DIR/trimmed_R2.fastq.gz" \
+    --thread $NSLOTS \
+    --length_required 100 \
+> "$OUT_DIR/fastp.log" 2>&1
+
+# --- 2. Assembly with SPAdes ---
+spades.py -1 "$OUT_DIR/trimmed_R1.fastq.gz" \
+          -2 "$OUT_DIR/trimmed_R2.fastq.gz" \
+          -o "$OUT_DIR/spades_out" \
+          --threads $NSLOTS \
+          --memory 120  \
+          > "$OUT_DIR/spades.log" 2>&1
+
+# --- 3. Kraken2 contamination check ---
+singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
+    --db "$DB_DIR" \
+    --report "$OUT_DIR/kraken_report.txt" \
+    --paired "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
+    > "$OUT_DIR/kraken_output.txt"
+
+# --- 4. BUSCO assessment on SPAdes assembly ---
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+singularity exec "$SIF_DIR/busco_v6.0.0_cv1.sif" busco \
+    -i "$OUT_DIR/spades_out/contigs.fasta" \
+    -o "$OUT_DIR/busco_spades" \
+    -l "$BUSCO_LINEAGE" \
+    -m genome \
+    --cpu 2 \
+    > "$OUT_DIR/busco_spades.log" 2>&1
+
+# --- 5. Mapping reads back to assembly ---
+singularity exec "$SIF_DIR/bwa.sif" bwa index "$OUT_DIR/spades_out/contigs.fasta"
+
+singularity exec "$SIF_DIR/bwa.sif" bwa mem -t $NSLOTS \
+    "$OUT_DIR/spades_out/contigs.fasta" \
+    "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
+    | singularity exec "$SIF_DIR/samtools.sif" samtools view -bS - \
+    > "$OUT_DIR/mapped.bam"
+
+singularity exec "$SIF_DIR/samtools.sif" samtools sort -@ $NSLOTS \
+    -o "$OUT_DIR/mapped.sorted.bam" "$OUT_DIR/mapped.bam"
+
+singularity exec "$SIF_DIR/samtools.sif" samtools index "$OUT_DIR/mapped.sorted.bam"
+
+# --- 6. Polishing with Pilon ---
+singularity exec "$SIF_DIR/pilon.sif" java -Xmx120G -jar /pilon/pilon.jar \
+    --genome "$OUT_DIR/spades_out/contigs.fasta" \
+    --frags "$OUT_DIR/mapped.sorted.bam" \
+    --output "$OUT_DIR/pilon_corrected" \
+    --threads $NSLOTS \
+    > "$OUT_DIR/pilon.log" 2>&1
+
+# --- 7. BUSCO assessment on Pilon-polished assembly ---
+singularity exec "$SIF_DIR/busco_v6.0.0_cv1.sif" busco \
+    -i "$OUT_DIR/pilon_corrected.fasta" \
+    -o "$OUT_DIR/busco_pilon" \
+    -l "$BUSCO_LINEAGE" \
+    -m genome \
+    --cpu 2 \
+    > "$OUT_DIR/busco_pilon.log" 2>&1
+
+# --- 8. MultiQC summary report ---
+singularity exec "$SIF_DIR/multiqc.sif" multiqc "$OUT_DIR" -o "$OUT_DIR/multiqc_report" \
+    > "$OUT_DIR/multiqc.log" 2>&1
+
+# --- 9. BlobTools2 contamination check ---
+BLOB_OUT="$OUT_DIR/contamination_checks/blobtoolkit"
+mkdir -p "$BLOB_OUT"
+
+singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools create \
+    --fasta "$OUT_DIR/spades_out/contigs.fasta" \
+    --taxdump "$BLOBTOOLKIT_DB" \
+    --name spore_1_sc \
+    --outdir "$BLOB_OUT"
+
+singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools map \
+    -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
+    -r "$R1" "$R2" \
+    --outdir "$BLOB_OUT"
+
+singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools view \
+    -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
+    -o "$BLOB_OUT"
+
+singularity exec "$SIF_DIR/blobtoolkit.sif" blobtools plot \
+    -i "$BLOB_OUT/spore_1_sc.blobDB.json" \
+    -o "$BLOB_OUT"
+
+echo "BlobTools2 run completed successfully."
+
+echo "Pipeline finished successfully."
