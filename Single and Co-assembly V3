@@ -26,6 +26,7 @@ DATA_DIR="$HOME/spore1All/sag/spore_1_sc"
 DB_DIR="$HOME/databases/kraken2_minusb_20250714"
 BUSCO_LINEAGE="$HOME/fungi_odb10"
 MULTIQC_CUSTOM="$HOME/multiqc_custom"
+VENV_DIR="$OUT_DIR/venv"                              <-------- FIX THIS
 
 R1="$DATA_DIR/spore_1_sc-00210_1.fastq.gz"
 R2="$DATA_DIR/spore_1_sc-00210_2.fastq.gz"
@@ -213,5 +214,387 @@ done
 
 echo "" >> "$summary_file"
 echo "Summary saved to: $summary_file"
+
+## -------------------------------
+## Figure Generation
+## -------------------------------
+
+# --- Create virtual environment & install required python packages if missing ---
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating venv at $VENV_DIR and installing packages..."
+    python3 -m venv "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+    pip install --upgrade pip
+    # --no-cache-dir reduces disk usage; remove if pip fails for you
+    pip install --no-cache-dir pandas matplotlib biopython
+else
+    source "$VENV_DIR/bin/activate"
+fi
+
+# --- Run plotting & PDF generation inline ---
+python3 - << 'PYCODE'
+import os, sys, json, gzip, glob, re, subprocess
+import math
+import pandas as pd
+import matplotlib.pyplot as plt
+from Bio import SeqIO
+from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
+
+OUT_DIR = os.path.expanduser(os.environ.get("OUT_DIR", "~/TESTOV54_out"))
+SIF_DIR = os.path.expanduser(os.environ.get("SIF_DIR", "~/sif_images"))
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Helper: run samtools depth (via singularity) to create depth.txt if possible
+def ensure_depth_file():
+    depth_file = os.path.join(OUT_DIR, "depth.txt")
+    if os.path.exists(depth_file):
+        print("depth.txt already present.")
+        return depth_file
+    bam = os.path.join(OUT_DIR, "mapped.sorted.bam")
+    sif = os.path.join(SIF_DIR, "samtools.sif")
+    if os.path.exists(bam) and os.path.exists(sif):
+        print("Generating depth.txt via samtools inside singularity...")
+        try:
+            with open(depth_file, "w") as out:
+                subprocess.check_call(["singularity", "exec", sif, "samtools", "depth", "-a", bam], stdout=out)
+            return depth_file
+        except subprocess.CalledProcessError as e:
+            print("samtools depth failed:", e, file=sys.stderr)
+            return None
+    else:
+        print("Either BAM or samtools.sif missing; cannot generate depth.txt.")
+        return None
+
+# Helper: find BUSCO short_summary file
+def find_busco_summary():
+    candidates = glob.glob(os.path.join(OUT_DIR, "**", "short_summary*"), recursive=True)
+    if candidates:
+        return candidates[0]
+    # try other variants
+    candidates = glob.glob(os.path.join(OUT_DIR, "**", "*short*summary*.txt"), recursive=True)
+    return candidates[0] if candidates else None
+
+# Helper: compute mean per-base qualities from FASTQ.gz (sample limited)
+def compute_mean_per_base_from_fastq(fq_path, max_reads=20000):
+    if not os.path.exists(fq_path):
+        return None
+    sums = []
+    counts = []
+    processed = 0
+    with gzip.open(fq_path, "rt") as fh:
+        for rec in SeqIO.parse(fh, "fastq"):
+            quals = rec.letter_annotations.get("phred_quality")
+            if quals is None:
+                continue
+            for i,q in enumerate(quals):
+                if i >= len(sums):
+                    extend_by = i+1 - len(sums)
+                    sums.extend([0]*extend_by)
+                    counts.extend([0]*extend_by)
+                sums[i] += q
+                counts[i] += 1
+            processed += 1
+            if processed >= max_reads:
+                break
+    if sum(counts) == 0:
+        return None
+    means = [ (sums[i]/counts[i]) if counts[i] > 0 else 0 for i in range(len(sums)) ]
+    return means
+
+# Store parsed data in-memory for making both single-page panel and multipage PDF
+read_qual = {}     # keys: 'fastp' or 'R1'/'R2' -> arrays
+contig_lengths = None
+assembly_stats = None
+busco_cats = None
+kraken_top = None
+depth_df = None
+
+# 1) Read QC: prefer Fastp JSON if present, otherwise derive from trimmed fastqs
+fastp_json = os.path.join(OUT_DIR, "fastp.json")
+if os.path.exists(fastp_json):
+    try:
+        with open(fastp_json) as f:
+            j = json.load(f)
+        # attempt to extract per_base_quality.mean; fallback if structure differs
+        if 'per_base_quality' in j and 'mean' in j['per_base_quality']:
+            read_qual['fastp'] = j['per_base_quality']['mean']
+            print("Loaded per-base mean qualities from fastp.json")
+        else:
+            print("fastp.json present but expected keys missing; will fallback to FASTQ sampling.")
+    except Exception as e:
+        print("Failed to parse fastp.json, will fallback to FASTQ sampling:", e)
+if 'fastp' not in read_qual:
+    # Try to sample trimmed fastqs
+    r1 = os.path.join(OUT_DIR, "trimmed_R1.fastq.gz")
+    r2 = os.path.join(OUT_DIR, "trimmed_R2.fastq.gz")
+    r1_means = compute_mean_per_base_from_fastq(r1, max_reads=20000)
+    r2_means = compute_mean_per_base_from_fastq(r2, max_reads=20000)
+    if r1_means is None and r2_means is None:
+        print("No FASTQ quality data available (no fastp.json and no trimmed fastqs). Skipping read-quality plot.")
+    else:
+        if r1_means is not None:
+            read_qual['R1'] = r1_means
+            print(f"Computed per-base mean quality from {os.path.basename(r1)} ({len(r1_means)} positions)")
+        if r2_means is not None:
+            read_qual['R2'] = r2_means
+            print(f"Computed per-base mean quality from {os.path.basename(r2)} ({len(r2_means)} positions)")
+
+# 2) Contig lengths & N50
+contigs_fasta = os.path.join(OUT_DIR, "spades_out", "contigs.fasta")
+if os.path.exists(contigs_fasta):
+    contigs = list(SeqIO.parse(contigs_fasta, "fasta"))
+    contig_lengths = [ len(c.seq) for c in contigs ]
+    sorted_lengths = sorted(contig_lengths, reverse=True)
+    total = sum(sorted_lengths)
+    cum = 0
+    n50 = 0
+    for l in sorted_lengths:
+        cum += l
+        if cum >= total/2:
+            n50 = l
+            break
+    assembly_stats = {"num_contigs": len(contigs), "total_length": total, "n50": n50}
+    print(f"Assembly stats: {assembly_stats}")
+else:
+    print("contigs.fasta not found; skipping contig-length plot.")
+
+# 3) BUSCO: find and parse robustly
+busco_file = find_busco_summary()
+if busco_file:
+    print("Found BUSCO summary:", busco_file)
+    with open(busco_file) as f:
+        for line in f:
+            line = line.strip()
+            # try to extract percentages robustly
+            # look for C:, D:, F:, M:
+            if line.startswith("C:") or "C:" in line:
+                C = None; D = None; F = None; M = None
+                m = re.search(r"C:\s*([\d\.]+)%", line)
+                if m: C = float(m.group(1))
+                m = re.search(r"D:\s*([\d\.]+)%", line)
+                if m: D = float(m.group(1))
+                m = re.search(r"F:\s*([\d\.]+)%", line)
+                if m: F = float(m.group(1))
+                m = re.search(r"M:\s*([\d\.]+)%", line)
+                if m: M = float(m.group(1))
+                # try alternative parsing if bracketed format
+                if C is not None:
+                    if F is None or M is None:
+                        # attempt to compute M as remainder
+                        if F is not None:
+                            M = max(0.0, 100.0 - C - F)
+                    if D is None:
+                        # if both C and S/D given inside brackets, try to extract D from "[S:..,D:..]"
+                        m2 = re.search(r"\[.*D:\s*([\d\.]+)%", line)
+                        if m2:
+                            D = float(m2.group(1))
+                    # fallback: set values to 0 if None
+                    D = D if D is not None else 0.0
+                    F = F if F is not None else 0.0
+                    M = M if M is not None else max(0.0, 100.0 - C - F)
+                    busco_cats = {"Complete": C, "Duplicated": D, "Fragmented": F, "Missing": M}
+                    print("Parsed BUSCO categories:", busco_cats)
+                    break
+    if 'busco_cats' not in locals():
+        print("Could not parse BUSCO summary file; skipping BUSCO plot.")
+else:
+    print("No BUSCO short_summary file found under OUT_DIR; skipping BUSCO plot.")
+
+# 4) Kraken2 report
+kraken_report = os.path.join(OUT_DIR, "kraken_report.txt")
+if os.path.exists(kraken_report):
+    try:
+        report = pd.read_csv(kraken_report, sep="\t", header=None, names=['perc','reads','tax_reads','rank','taxid','name'], engine="python")
+        report['name'] = report['name'].astype(str).str.strip()
+        kraken_top = report.sort_values('perc', ascending=False).head(10)
+        print("Loaded kraken top taxa.")
+    except Exception as e:
+        print("Failed to parse kraken_report.txt:", e)
+else:
+    print("kraken_report.txt not found; skipping Kraken plot.")
+
+# 5) Coverage / depth
+depth_path = ensure_depth_file()
+if depth_path and os.path.exists(depth_path):
+    try:
+        depth_df = pd.read_csv(depth_path, sep="\t", header=None, names=['contig','pos','depth'], engine="python")
+        print("Loaded depth.txt with", len(depth_df), "rows.")
+    except Exception as e:
+        print("Failed to read depth.txt:", e)
+else:
+    print("No depth data available; skipping coverage plot.")
+
+# === Produce multipage PDF and individual PNGs ===
+pdf_multi = os.path.join(OUT_DIR, "summary_plots.pdf")
+with PdfPages(pdf_multi) as pdf:
+    # Read QC (fastp or fastq)
+    if 'fastp' in read_qual or 'R1' in read_qual or 'R2' in read_qual:
+        fig, ax = plt.subplots(figsize=(6,4))
+        if 'fastp' in read_qual:
+            means = read_qual['fastp']
+            ax.plot(range(1, len(means)+1), means, label='fastp(mean)')
+        if 'R1' in read_qual:
+            means = read_qual['R1']
+            ax.plot(range(1, len(means)+1), means, label='R1 (sampled)')
+        if 'R2' in read_qual:
+            means = read_qual['R2']
+            ax.plot(range(1, len(means)+1), means, label='R2 (sampled)')
+        ax.set_xlabel("Base position")
+        ax.set_ylabel("Mean quality")
+        ax.set_title("Per-base quality")
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT_DIR, "read_quality.png"), dpi=300)
+        pdf.savefig(fig)
+        plt.close(fig)
+    else:
+        print("Skipping read-quality on PDF: no data.")
+
+    # Contig lengths
+    if contig_lengths is not None:
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.hist(contig_lengths, bins=50, log=True)
+        ax.set_xlabel("Contig length (bp)")
+        ax.set_ylabel("Count (log scale)")
+        ax.set_title("Contig Length Distribution")
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT_DIR, "contig_lengths.png"), dpi=300)
+        pdf.savefig(fig)
+        plt.close(fig)
+    else:
+        print("Skipping contig-length PDF page: no contigs.fasta")
+
+    # BUSCO
+    if 'busco_cats' in locals() and busco_cats is not None:
+        fig, ax = plt.subplots(figsize=(4,4))
+        names = list(busco_cats.keys())
+        vals = [busco_cats[k] for k in names]
+        ax.bar(names, vals, color=['green','blue','orange','red'])
+        ax.set_ylabel("Percentage")
+        ax.set_title("BUSCO completeness")
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT_DIR, "busco_plot.png"), dpi=300)
+        pdf.savefig(fig)
+        plt.close(fig)
+    else:
+        print("Skipping BUSCO PDF page: no BUSCO data.")
+
+    # Kraken top taxa
+    if kraken_top is not None:
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.barh(kraken_top['name'], kraken_top['perc'])
+        ax.set_xlabel("Percentage of reads")
+        ax.set_ylabel("Taxon")
+        ax.set_title("Top Kraken2 taxa")
+        ax.invert_yaxis()
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT_DIR, "kraken_plot.png"), dpi=300)
+        pdf.savefig(fig)
+        plt.close(fig)
+    else:
+        print("Skipping Kraken PDF page: no kraken report")
+
+    # Coverage
+    if depth_df is not None:
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.hist(depth_df['depth'].clip(upper=10**6), bins=100, log=True)  # clip extremely large depths
+        ax.set_xlabel("Coverage depth")
+        ax.set_ylabel("Count (log scale)")
+        ax.set_title("Coverage depth histogram")
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT_DIR, "coverage_hist.png"), dpi=300)
+        pdf.savefig(fig)
+        plt.close(fig)
+    else:
+        print("Skipping coverage PDF page: no depth data")
+
+print("Multi-page PDF and individual PNGs saved under:", OUT_DIR)
+
+# === Create single-page multi-panel figure (2x3) ===
+panel_file = os.path.join(OUT_DIR, "summary_plots_panel.pdf")
+fig, axes = plt.subplots(2,3, figsize=(12,8))
+axes = axes.flatten()
+
+# slot 0: read quality
+ax = axes[0]
+if 'fastp' in read_qual or 'R1' in read_qual or 'R2' in read_qual:
+    if 'fastp' in read_qual:
+        ax.plot(range(1,len(read_qual['fastp'])+1), read_qual['fastp'], label='fastp(mean)')
+    if 'R1' in read_qual:
+        ax.plot(range(1,len(read_qual['R1'])+1), read_qual['R1'], label='R1')
+    if 'R2' in read_qual:
+        ax.plot(range(1,len(read_qual['R2'])+1), read_qual['R2'], label='R2')
+    ax.set_title("Per-base quality")
+    ax.set_xlabel("Base")
+    ax.set_ylabel("Mean Q")
+    ax.legend(fontsize='small')
+else:
+    ax.text(0.5,0.5,"Read quality data\nnot available", ha='center', va='center')
+    ax.set_axis_off()
+
+# slot 1: contig length
+ax = axes[1]
+if contig_lengths is not None:
+    ax.hist(contig_lengths, bins=50, log=True)
+    ax.set_title("Contig lengths (log count)")
+    ax.set_xlabel("bp")
+else:
+    ax.text(0.5,0.5,"Contigs not found", ha='center', va='center')
+    ax.set_axis_off()
+
+# slot 2: BUSCO
+ax = axes[2]
+if 'busco_cats' in locals() and busco_cats is not None:
+    names = list(busco_cats.keys())
+    vals = [busco_cats[k] for k in names]
+    ax.bar(names, vals, color=['green','blue','orange','red'])
+    ax.set_title("BUSCO")
+else:
+    ax.text(0.5,0.5,"BUSCO summary\nnot available", ha='center', va='center')
+    ax.set_axis_off()
+
+# slot 3: Kraken
+ax = axes[3]
+if kraken_top is not None:
+    ax.barh(kraken_top['name'], kraken_top['perc'])
+    ax.set_title("Top Kraken taxa")
+    ax.invert_yaxis()
+else:
+    ax.text(0.5,0.5,"Kraken report\nnot available", ha='center', va='center')
+    ax.set_axis_off()
+
+# slot 4: coverage
+ax = axes[4]
+if depth_df is not None:
+    ax.hist(depth_df['depth'].clip(upper=10**6), bins=100, log=True)
+    ax.set_title("Coverage depth")
+else:
+    ax.text(0.5,0.5,"Coverage depth\nnot available", ha='center', va='center')
+    ax.set_axis_off()
+
+# slot 5: assembly stats text
+ax = axes[5]
+ax.axis('off')
+if assembly_stats is not None:
+    txt = f"Num contigs: {assembly_stats['num_contigs']}\nTotal length: {assembly_stats['total_length']}\nN50: {assembly_stats['n50']}"
+    ax.text(0.1,0.5,txt, fontsize=10, va='center')
+else:
+    ax.text(0.5,0.5,"Assembly stats\nnot available", ha='center', va='center')
+
+fig.tight_layout()
+fig.savefig(panel_file, dpi=300)
+plt.close(fig)
+print("Single-page panel PDF saved to:", panel_file)
+
+PYCODE
+
+# Deactivate venv
+deactivate || true
+
+echo "Plot job finished; check $OUT_DIR for PNGs and PDFs."
+
 
 
