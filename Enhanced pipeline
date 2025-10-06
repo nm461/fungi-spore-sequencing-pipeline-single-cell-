@@ -1,11 +1,11 @@
 #!/bin/bash
-#$ -N Enhanced_pipeline
+#$ -N Enhanced_Pipeline_10
 #$ -cwd
 #$ -l h_rt=72:00:00
 #$ -l s_vmem=16G,mem_req=16G
 #$ -pe def_slot 8
-#$ -o $HOME/logs/Enhanced_pipeline.log
-#$ -e $HOME/logs/Enhanced_pipeline.err
+#$ -o $HOME/logs/Enhanced_Pipeline_10.log
+#$ -e $HOME/logs/Enhanced_Pipeline_10.err
 
 set -e
 set -x
@@ -16,26 +16,26 @@ set -x
 module use /usr/local/package/modulefiles
 module load apptainer
 module load blast+/2.15.0
-module load repeatmasker/4.1.6 || true   # harmless; we do NOT run RepeatMasker
+module load repeatmasker/4.1.6 || true   # harmless; RepeatMasker is skipped in pipeline
 
-# (rmblast path harmless if unused)
 export PATH="$HOME/tools/rmblast/rmblast-2.14.1/bin:$PATH"
 
 # =========================
 # Directories & inputs
 # =========================
-OUT_ROOT="$HOME/TESTOV54_out"        ---> name of your master output dir
+OUT_ROOT="$HOME/Enhanced_Pipeline_10_out"
 SIF_DIR="$HOME/sif_images"
 DATA_DIR="$HOME/spore1All/sag/spore_1_sc"
 DB_DIR="$HOME/databases/kraken2_plusPFP_16G/k2_pluspfp_16G"   # Kraken2 DB dir (contains *.k2d)
 BUSCO_LINEAGE="$HOME/fungi_odb10"                              # BUSCO lineage dir
 MULTIQC_CUSTOM="$HOME/multiqc_custom"
 
-# Limit how many samples to run this time ---> CHANGE TO ACTUAL NUMBER OF SAMPLE IN REAL RUN
+# Limit how many samples to run this time
 MAX_SAMPLES=10
 
 mkdir -p "$OUT_ROOT"
-export SIF_DIR  # so inline Python can see it
+export SIF_DIR
+export OUT_ROOT
 
 # =========================
 # Shared Python venv (once)
@@ -45,7 +45,7 @@ if [ ! -d "$SHARED_VENV" ]; then
   python3 -m venv "$SHARED_VENV"
   source "$SHARED_VENV/bin/activate"
   pip install --upgrade pip
-  pip install --no-cache-dir pandas numpy matplotlib seaborn biopython scipy
+  pip install --no-cache-dir pandas numpy matplotlib seaborn biopython scipy PyPDF2
   deactivate
 fi
 
@@ -54,7 +54,6 @@ fi
 # =========================
 processed=0
 for R1 in "$DATA_DIR"/*_1.fastq.gz; do
-  # stop once we’ve hit the limit
   if [ "$processed" -ge "$MAX_SAMPLES" ]; then
     echo "Reached MAX_SAMPLES=$MAX_SAMPLES; stopping."
     break
@@ -67,12 +66,9 @@ for R1 in "$DATA_DIR"/*_1.fastq.gz; do
     continue
   fi
 
-  # count this sample before heavy work
   processed=$((processed + 1))
-
-  OUT_DIR="$OUT_ROOT/NEW_${sample}_out"
+  OUT_DIR="$OUT_ROOT/${sample}_out"
   mkdir -p "$OUT_DIR"
-
   echo "==== Processing $sample ===="
 
   # ---------- 1. Fastp ----------
@@ -110,10 +106,9 @@ for R1 in "$DATA_DIR"/*_1.fastq.gz; do
   export MKL_NUM_THREADS=1
 
   TS=$(date +%Y%m%d%H%M%S)
-  BUSCO_RUN="NEW_busco_spades_${TS}"
+  BUSCO_RUN="busco_spades_${TS}"
   BUSCO_LOG="$OUT_DIR/${BUSCO_RUN}.log"
 
-  # Preflight diagnostics (non-fatal) to help debug path/visibility
   {
     echo "=== BUSCO preflight for $sample ==="
     date
@@ -122,15 +117,11 @@ for R1 in "$DATA_DIR"/*_1.fastq.gz; do
     echo "BUSCO_LINEAGE: $BUSCO_LINEAGE"; ls -lh "$BUSCO_LINEAGE" | head || true
     echo "--- Inside container checks ---"
     singularity exec -B "$OUT_DIR:$OUT_DIR" "$SIF_DIR/busco_v6.0.0_cv1.sif" bash -lc '
-      echo "whoami: $(whoami)"; echo "pwd: $(pwd)"
       echo "busco version:"; busco --version || true
-      echo "OUT_DIR inside:"; ls -ld '"$OUT_DIR"' || true
-      echo "ASSEMBLY inside:"; ls -lh '"$ASSEMBLY"' || true
-      echo "LINEAGE inside:"; ls -ld '"$BUSCO_LINEAGE"' || true; ls -lh '"$BUSCO_LINEAGE"' 2>/dev/null | head || true
+      echo "pwd: $(pwd)"
     ' || true
-  } > "$OUT_DIR/NEW_busco_diag.log" 2>&1
+  } > "$OUT_DIR/busco_diag.log" 2>&1
 
-  # One-line BUSCO (avoids stray-arg parsing) with UNIQUE run name
   singularity exec -B "$OUT_DIR:$OUT_DIR" "$SIF_DIR/busco_v6.0.0_cv1.sif" \
     busco -i "$ASSEMBLY" -o "$BUSCO_RUN" -l "$BUSCO_LINEAGE" -m genome --cpu 2 --out_path "$OUT_DIR" \
     > "$BUSCO_LOG" 2>&1
@@ -165,15 +156,18 @@ for R1 in "$DATA_DIR"/*_1.fastq.gz; do
     "$SM_OUT/assembly.sig" "$SM_DB" \
     -o "$SM_OUT/gather_results.csv"
 
-  # ---------- 8. Per-sample figures (PNG + PDF + single-page panel) ----------
+  # ---------- 8. Per-sample figures & Japanese summary + combined PDF ----------
   source "$SHARED_VENV/bin/activate"
   export OUT_DIR SIF_DIR
 
   python3 - << 'PY_PER_SAMPLE'
 import os, json, gzip, re, glob, subprocess, shutil, datetime
 import numpy as np, pandas as pd, matplotlib.pyplot as plt, seaborn as sns
-from Bio import SeqIO
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib import font_manager as fm
+from matplotlib.ticker import MaxNLocator
+from Bio import SeqIO
+from PyPDF2 import PdfMerger
 
 OUT_DIR=os.environ.get('OUT_DIR','')
 SIF_DIR=os.path.expanduser(os.environ.get('SIF_DIR','~/sif_images'))
@@ -182,6 +176,25 @@ if not OUT_DIR:
 
 sns.set_style("whitegrid")
 plt.rcParams['figure.dpi']=120
+
+# --------- Choose a JP-capable font if available (for summary page) ---------
+def pick_jp_font():
+    preferred = ['Noto Sans CJK JP', 'NotoSansCJK-Regular', 'IPAGothic', 'IPAexGothic',
+                 'TakaoGothic', 'VL Gothic', 'Source Han Sans JP', 'SourceHanSansJP']
+    paths = fm.findSystemFonts(fontpaths=None, fontext='ttf') + fm.findSystemFonts(fontpaths=None, fontext='ttc')
+    names = {}
+    for p in paths:
+        try:
+            prop = fm.FontProperties(fname=p)
+            names[fm.get_font(p).family_name] = p
+        except Exception:
+            pass
+    for name in preferred:
+        if name in names:
+            return fm.FontProperties(fname=names[name])
+    return None
+
+JP_FONT = pick_jp_font()
 
 def annot(ax, text):
     ax.text(0.98,0.95,text,transform=ax.transAxes,ha="right",va="top",
@@ -256,13 +269,14 @@ if os.path.exists(fa):
             if csum>=total/2:
                 n50=L; break
 
-# BUSCO: pick latest NEW_busco_spades*.log
+# BUSCO: latest log
 busco_vals={}
 busco_n=None
-log_cands=sorted(glob.glob(os.path.join(OUT_DIR,"NEW_busco_spades*.log")), key=os.path.getmtime, reverse=True)
+log_cands=sorted(glob.glob(os.path.join(OUT_DIR,"*.log")), key=os.path.getmtime, reverse=True)
+log_cands=[p for p in log_cands if os.path.basename(p).startswith("busco_spades_")]
 if log_cands:
     blog=log_cands[0]
-    for line in open(blog):
+    for line in open(blog, encoding='utf-8', errors='ignore'):
         m=re.search(r"C:(\d+\.\d+)%.*D:(\d+\.\d+)%.*F:(\d+\.\d+)%.*M:(\d+\.\d+)%.*n:(\d+)", line)
         if m:
             vals=list(m.groups())
@@ -287,16 +301,18 @@ if depth_path and os.path.exists(depth_path):
         ddf=pd.read_csv(depth_path,sep="\t",header=None,names=["contig","pos","depth"])
     except: pass
 
-# --- Multi-page PDF (goes to graphs/ later) ---
-mp_pdf=os.path.join(OUT_DIR,"NEW_summary_plots.pdf")
+# --------- MULTI-PAGE PDF (graphs) ---------
+mp_pdf=os.path.join(OUT_DIR,"summary_plots.pdf")
 with PdfPages(mp_pdf) as pdf:
-    # Read quality
+    # Read quality (labels)
     if read_qual:
         fig,ax=plt.subplots(figsize=(6,4))
         if "R1" in read_qual: ax.plot(read_qual["R1"], label="R1", color="blue")
         if "R2" in read_qual: ax.plot(read_qual["R2"], label="R2", color="orange")
         if "fastp" in read_qual: ax.plot(read_qual["fastp"], label="fastp(mean)", color="green", linestyle="--")
-        ax.set_title("Per-base read quality"); ax.set_xlabel("Base position"); ax.set_ylabel("Mean Q")
+        ax.set_title("Per-base read quality")
+        ax.set_xlabel("Base position")
+        ax.set_ylabel("Mean Phred quality")
         ax.legend(fontsize=8); ax.grid(True,alpha=0.3)
         allq=[]
         for k in read_qual: allq.extend(read_qual[k][:150])
@@ -304,43 +320,53 @@ with PdfPages(mp_pdf) as pdf:
             annot(ax, f"Mean={np.mean(allq):.1f}  SD={np.std(allq):.1f}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # Contig length histogram (purple)
+    # Contig length histogram in Mb
     if contig_lengths:
+        x = np.array(contig_lengths)/1e6
         fig,ax=plt.subplots(figsize=(6,4))
-        ax.hist(contig_lengths, bins=50, color="purple", edgecolor="black", alpha=0.8, log=True)
-        ax.set_title("Contig length distribution"); ax.set_xlabel("Length (bp)"); ax.set_ylabel("Count (log)")
-        annot(ax, f"N50={n50:,}  Total={total/1e6:.2f} Mb  n={len(contig_lengths)}")
+        ax.hist(x, bins=50, color="purple", edgecolor="black", alpha=0.8, log=True)
+        ax.set_title("Contig length distribution")
+        ax.set_xlabel("Contig length (Mb)")
+        ax.set_ylabel("Count (log scale)")
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
+        annot(ax, f"N50={n50/1e6:.3f} Mb  Total={total/1e6:.2f} Mb  n={len(contig_lengths)}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # BUSCO per-sample (bar)
+    # BUSCO per-sample (bar, clear axes)
     if busco_vals:
-        fig,ax=plt.subplots(figsize=(5,4))
+        fig,ax=plt.subplots(figsize=(6,4))
         order=["Complete","Duplicated","Fragmented","Missing"]
         cols=["forestgreen","royalblue","darkorange","red"]
         ax.bar(order,[busco_vals.get(k,0) for k in order], color=cols, alpha=0.9)
-        ax.set_ylim(0,100); ax.set_ylabel("Percentage")
+        ax.set_ylim(0,100)
+        ax.set_ylabel("Percentage (%)")
         ax.set_title("BUSCO completeness (per-sample)")
+        ax.tick_params(axis='x', labelrotation=0)
         annot(ax, f"C={busco_vals.get('Complete',np.nan):.1f}%  D={busco_vals.get('Duplicated',np.nan):.1f}%  F={busco_vals.get('Fragmented',np.nan):.1f}%")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # Kraken top taxa (teal palette)
+    # Kraken top taxa (x axis labeled)
     if kdf is not None and not kdf.empty:
         top = kdf.sort_values("perc",ascending=False).head(10)
         fig,ax=plt.subplots(figsize=(6,4))
         sns.barplot(y=top["name"], x=top["perc"], palette="crest", ax=ax)
-        ax.set_title("Kraken2: Top taxa (% reads)"); ax.set_xlabel("% of reads"); ax.set_ylabel("Taxon")
+        ax.set_title("Kraken2: Top taxa")
+        ax.set_xlabel("% of reads (Kraken2)")
+        ax.set_ylabel("Taxon")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # Coverage depth histogram (dark green)
+    # Coverage depth histogram (labels)
     if ddf is not None and not ddf.empty:
         fig,ax=plt.subplots(figsize=(6,4))
         ax.hist(ddf["depth"], bins=100, color="seagreen", edgecolor="black", alpha=0.85, log=True)
-        ax.set_title("Coverage depth histogram"); ax.set_xlabel("Depth"); ax.set_ylabel("Count (log)")
+        ax.set_title("Coverage depth histogram")
+        ax.set_xlabel("Coverage depth (×)")
+        ax.set_ylabel("Count (log scale)")
         annot(ax, f"Mean={ddf['depth'].mean():.1f}×  Median={ddf['depth'].median():.1f}×")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-# --- Single-page panel PDF beside summary.txt ---
-panel_pdf=os.path.join(OUT_DIR,"NEW_summary_panel.pdf")
+# --------- SINGLE-PAGE PANEL (identical styling) ---------
+panel_pdf=os.path.join(OUT_DIR,"summary_panel.pdf")
 fig, axes = plt.subplots(2,3, figsize=(12,8))
 axes = axes.flatten()
 
@@ -350,15 +376,20 @@ if read_qual:
     if "R1" in read_qual: ax.plot(read_qual["R1"], label="R1", color="blue")
     if "R2" in read_qual: ax.plot(read_qual["R2"], label="R2", color="orange")
     if "fastp" in read_qual: ax.plot(read_qual["fastp"], label="fastp", color="green", linestyle="--")
-    ax.set_title("Read quality"); ax.legend(fontsize=7)
+    ax.set_title("Read quality")
+    ax.set_xlabel("Base position")
+    ax.set_ylabel("Mean Phred quality")
+    ax.legend(fontsize=7)
 else:
     ax.text(0.5,0.5,"No read quality",ha="center",va="center"); ax.set_axis_off()
 
 # 2: Contig lengths
 ax=axes[1]
 if contig_lengths:
-    ax.hist(contig_lengths, bins=40, color="purple", edgecolor="black", alpha=0.85, log=True)
+    ax.hist(np.array(contig_lengths)/1e6, bins=40, color="purple", edgecolor="black", alpha=0.85, log=True)
     ax.set_title("Contig lengths (log count)")
+    ax.set_xlabel("Mb")
+    ax.set_ylabel("Count (log)")
 else:
     ax.text(0.5,0.5,"No contigs",ha="center",va="center"); ax.set_axis_off()
 
@@ -368,7 +399,9 @@ if busco_vals:
     order=["Complete","Duplicated","Fragmented","Missing"]
     cols=["forestgreen","royalblue","darkorange","red"]
     ax.bar(order,[busco_vals.get(k,0) for k in order], color=cols)
-    ax.set_ylim(0,100); ax.set_title("BUSCO")
+    ax.set_ylim(0,100)
+    ax.set_title("BUSCO")
+    ax.set_ylabel("Percentage (%)")
 else:
     ax.text(0.5,0.5,"No BUSCO",ha="center",va="center"); ax.set_axis_off()
 
@@ -377,6 +410,8 @@ ax=axes[3]
 if kdf is not None and not kdf.empty:
     top=kdf.sort_values("perc",ascending=False).head(10)
     ax.barh(top["name"], top["perc"], color="teal", alpha=0.9)
+    ax.set_xlabel("% of reads (Kraken2)")
+    ax.set_ylabel("Taxon")
     ax.invert_yaxis(); ax.set_title("Kraken top taxa")
 else:
     ax.text(0.5,0.5,"No Kraken",ha="center",va="center"); ax.set_axis_off()
@@ -386,6 +421,8 @@ ax=axes[4]
 if ddf is not None and not ddf.empty:
     ax.hist(ddf["depth"], bins=80, color="seagreen", edgecolor="black", alpha=0.85, log=True)
     ax.set_title("Coverage depth")
+    ax.set_xlabel("Coverage depth (×)")
+    ax.set_ylabel("Count (log)")
 else:
     ax.text(0.5,0.5,"No depth",ha="center",va="center"); ax.set_axis_off()
 
@@ -393,8 +430,8 @@ else:
 ax=axes[5]; ax.axis('off')
 txt = []
 if total>0: txt.append(f"Total: {total/1e6:.2f} Mb")
-if n50>0:   txt.append(f"N50: {n50:,} bp")
-if max_ctg>0: txt.append(f"Max contig: {max_ctg:,} bp")
+if n50>0:   txt.append(f"N50: {n50/1e6:.3f} Mb")
+if max_ctg>0: txt.append(f"Max contig: {max_ctg/1e6:.3f} Mb")
 if contig_lengths: txt.append(f"Contigs: {len(contig_lengths)}")
 if busco_vals: txt.append(f"BUSCO C={busco_vals.get('Complete',np.nan):.1f}%")
 ax.text(0.02,0.6,"\n".join(txt) if txt else "No assembly stats", fontsize=10)
@@ -403,8 +440,7 @@ fig.tight_layout()
 fig.savefig(panel_pdf, dpi=300)
 plt.close(fig)
 
-# -------- Japanese summary.txt --------
-# Gather extra values from fastp.json if available
+# -------- Japanese summary.txt (saved to disk) --------
 q30=None; r1len=None; r2len=None; pairs_before=None; pairs_after=None
 if os.path.exists(fjson):
     try:
@@ -416,7 +452,6 @@ if os.path.exists(fjson):
         pairs_after  = jj.get("summary",{}).get("after_filtering",{}).get("total_reads")
     except: pass
 
-# Top kraken taxa text
 kraken_top_text=[]
 if kdf is not None and not kdf.empty:
     top = kdf.sort_values("perc", ascending=False).head(5)
@@ -428,7 +463,6 @@ with open(summary_path,"w",encoding="utf-8") as w:
     w.write("=== サンプル概要 / TESTOV54 パイプライン ===\n")
     w.write(f"実行日時          : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M %Z')}\n")
     w.write(f"出力ディレクトリ  : {OUT_DIR}\n")
-    # Inputs (trimmed files)
     w.write("入力ファイル       :\n")
     w.write(f"  R1 = {r1p}\n")
     w.write(f"  R2 = {r2p}\n\n")
@@ -440,8 +474,6 @@ with open(summary_path,"w",encoding="utf-8") as w:
     w.write("  BWA/Samtools : マッピング・深さ集計\n")
     w.write("  Pilon        : マッピングに基づくアセンブリのポリッシング\n")
     w.write("  Sourmash     : k-mer スケッチと類似性評価\n\n")
-
-    # [1] Fastp
     w.write("------------------------------------------------------------\n")
     w.write("[1] Fastp 品質管理（トリミング後の要約）\n")
     if pairs_before is not None and pairs_after is not None:
@@ -450,61 +482,122 @@ with open(summary_path,"w",encoding="utf-8") as w:
     if q30 is not None: w.write(f"  Q30塩基割合              : {100.0*float(q30):.1f}%\n")
     if r1len is not None and r2len is not None:
         w.write(f"  平均リード長（R1/R2）    : {float(r1len):.1f} / {float(r2len):.1f} bp\n")
-    w.write("  参照図                  : graphs/NEW_fig_read_quality.png\n\n")
-
-    # [2] SPAdes
+    w.write("  参照図                  : graphs/fig_read_quality.png\n\n")
     w.write("[2] SPAdes アセンブリ結果\n")
     if contig_lengths:
         w.write(f"  コンティグ数             : {len(contig_lengths):,}\n")
         w.write(f"  総長                      : {total/1e6:.2f} Mb\n")
-        w.write(f"  N50                      : {n50:,} bp\n")
-        w.write(f"  最大コンティグ            : {max_ctg:,} bp\n")
+        w.write(f"  N50                      : {n50/1e6:.3f} Mb\n")
+        w.write(f"  最大コンティグ            : {max_ctg/1e6:.3f} Mb\n")
     w.write("  出力FASTA                : raw_outputs/spades/contigs.fasta\n")
-    w.write("  参照図                  : graphs/NEW_fig_contig_lengths.png\n\n")
-
-    # [3] Kraken2
+    w.write("  参照図                  : graphs/fig_contig_lengths.png\n\n")
     w.write("[3] Kraken2 タクソノミー（上位）\n")
     if kraken_top_text:
         for t in kraken_top_text: w.write(f"  {t}\n")
     w.write("  レポート               : raw_outputs/kraken2/kraken_report.txt\n")
-    w.write("  参照図                 : graphs/NEW_fig_kraken_top.png\n\n")
-
-    # [4] BUSCO
+    w.write("  参照図                 : graphs/fig_kraken_top.png\n\n")
     w.write("[4] BUSCO 網羅率（fungi_odb10）\n")
     if busco_vals:
         w.write(f"  Complete（完全）        : {busco_vals.get('Complete',0):.1f}%\n")
+    if busco_vals:
         w.write(f"    └ Duplicated（重複）  : {busco_vals.get('Duplicated',0):.1f}%\n")
         w.write(f"  Fragmented（断片）      : {busco_vals.get('Fragmented',0):.1f}%\n")
         w.write(f"  Missing（欠損）         : {busco_vals.get('Missing',0):.1f}%\n")
         if busco_n: w.write(f"  データセット n         : {busco_n}\n")
-    w.write("  実行ログ               : logs/NEW_busco_spades_*.log\n")
-    w.write("  実行ディレクトリ       : raw_outputs/busco/run_NEW_busco_spades_*\n")
-    w.write("  参照図                 : graphs/NEW_fig_busco.png\n\n")
-
-    # [5] Mapping / Coverage
+    w.write("  実行ログ               : logs/busco_spades_*.log\n")
+    w.write("  実行ディレクトリ       : raw_outputs/busco/run_busco_spades_*\n")
+    w.write("  参照図                 : graphs/fig_busco.png\n\n")
     w.write("[5] マッピングとカバレッジ（BWA/Samtools）\n")
     w.write("  BAM                     : raw_outputs/mapping/mapped.sorted.bam（+ .bai）\n")
     if ddf is not None and not ddf.empty:
         w.write(f"  平均被覆深さ（mean / median）: {ddf['depth'].mean():.1f}× / {ddf['depth'].median():.1f}×\n")
     w.write("  深さ表（samtools depth） : raw_outputs/mapping/depth.txt\n")
-    w.write("  参照図                 : graphs/NEW_fig_coverage_hist.png\n\n")
-
-    # [6] Pilon
+    w.write("  参照図                 : graphs/fig_coverage_hist.png\n\n")
     w.write("[6] Pilon ポリッシング\n")
     w.write("  出力FASTA               : raw_outputs/pilon/pilon_corrected.fasta\n")
     w.write("  ログ                    : logs/pilon.log\n\n")
-
-    # [7] Sourmash
     w.write("[7] Sourmash 類似性（gather）\n")
     w.write("  出力（sig/CSV）         : raw_outputs/sourmash/assembly.sig, gather_results.csv\n")
     w.write("  ※ マスター報告書ではサンプル間ヒートマップを別途作成\n\n")
-
     w.write("------------------------------------------------------------\n")
     w.write("図（graphs/）とログ（logs/）に詳細があります。\n")
 
-# Done; leave panel PDF in OUT_DIR root.
-print("Per-sample multi-page PDF:", mp_pdf)
-print("Per-sample single-page panel:", panel_pdf)
+# --------- Save main figure PNGs for graphs/ ---------
+# (these match labels/titles exactly)
+def save_single_png(fig_func, path):
+    fig = fig_func()
+    if fig is not None:
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+
+# read quality figure
+def fig_readq():
+    if not read_qual: return None
+    fig,ax=plt.subplots(figsize=(6,4))
+    if "R1" in read_qual: ax.plot(read_qual["R1"], label="R1", color="blue")
+    if "R2" in read_qual: ax.plot(read_qual["R2"], label="R2", color="orange")
+    if "fastp" in read_qual: ax.plot(read_qual["fastp"], label="fastp", color="green", linestyle="--")
+    ax.set_title("Per-base read quality"); ax.set_xlabel("Base position"); ax.set_ylabel("Mean Phred quality")
+    ax.legend(fontsize=8); ax.grid(True,alpha=0.3); fig.tight_layout(); return fig
+
+def fig_contigs():
+    if not contig_lengths: return None
+    fig,ax=plt.subplots(figsize=(6,4))
+    ax.hist(np.array(contig_lengths)/1e6, bins=50, color="purple", edgecolor="black", alpha=0.8, log=True)
+    ax.set_title("Contig length distribution"); ax.set_xlabel("Contig length (Mb)"); ax.set_ylabel("Count (log scale)")
+    fig.tight_layout(); return fig
+
+def fig_busco():
+    if not busco_vals: return None
+    fig,ax=plt.subplots(figsize=(6,4))
+    order=["Complete","Duplicated","Fragmented","Missing"]; cols=["forestgreen","royalblue","darkorange","red"]
+    ax.bar(order,[busco_vals.get(k,0) for k in order], color=cols, alpha=0.9)
+    ax.set_ylim(0,100); ax.set_ylabel("Percentage (%)"); ax.set_title("BUSCO completeness (per-sample)")
+    fig.tight_layout(); return fig
+
+def fig_kraken():
+    if kdf is None or kdf.empty: return None
+    top = kdf.sort_values("perc",ascending=False).head(10)
+    fig,ax=plt.subplots(figsize=(6,4))
+    sns.barplot(y=top["name"], x=top["perc"], palette="crest", ax=ax)
+    ax.set_title("Kraken2: Top taxa"); ax.set_xlabel("% of reads (Kraken2)"); ax.set_ylabel("Taxon")
+    fig.tight_layout(); return fig
+
+def fig_cov():
+    if ddf is None or ddf.empty: return None
+    fig,ax=plt.subplots(figsize=(6,4))
+    ax.hist(ddf["depth"], bins=100, color="seagreen", edgecolor="black", alpha=0.85, log=True)
+    ax.set_title("Coverage depth histogram"); ax.set_xlabel("Coverage depth (×)"); ax.set_ylabel("Count (log scale)")
+    fig.tight_layout(); return fig
+
+save_single_png(fig_readq, os.path.join(OUT_DIR,"fig_read_quality.png"))
+save_single_png(fig_contigs, os.path.join(OUT_DIR,"fig_contig_lengths.png"))
+save_single_png(fig_busco, os.path.join(OUT_DIR,"fig_busco.png"))
+save_single_png(fig_kraken, os.path.join(OUT_DIR,"fig_kraken_top.png"))
+save_single_png(fig_cov, os.path.join(OUT_DIR,"fig_coverage_hist.png"))
+
+# --------- Build summary PAGE 1 as PDF (Japanese font if available) ---------
+summary_pdf=os.path.join(OUT_DIR,"summary_page.pdf")
+txt=open(summary_path, "r", encoding="utf-8", errors="ignore").read()
+fig,ax=plt.subplots(figsize=(8.5,11))
+ax.axis('off')
+if JP_FONT:
+    ax.text(0.06, 0.96, txt, va='top', ha='left', fontproperties=JP_FONT, fontsize=11, linespacing=1.25)
+else:
+    ax.text(0.06, 0.96, txt, va='top', ha='left', family='monospace', fontsize=10, linespacing=1.2)
+fig.tight_layout()
+fig.savefig(summary_pdf, dpi=300)
+plt.close(fig)
+
+# --------- Combined per-sample PDF: summary_page (p1) + EXACT panel (p2) ---------
+combined_pdf=os.path.join(OUT_DIR,"sample_report.pdf")
+merger=PdfMerger()
+if os.path.exists(summary_pdf): merger.append(summary_pdf)
+if os.path.exists(panel_pdf):   merger.append(panel_pdf)   # exact page
+merger.write(combined_pdf); merger.close()
+
+print("Per-sample panel PDF:", panel_pdf)
+print("Per-sample combined PDF:", combined_pdf)
 PY_PER_SAMPLE
 
   deactivate
@@ -519,67 +612,64 @@ PY_PER_SAMPLE
   [ -f "$OUT_DIR/trimmed_R1.fastq.gz" ] && mv "$OUT_DIR/trimmed_R1.fastq.gz" "$RAW/fastp/"
   [ -f "$OUT_DIR/trimmed_R2.fastq.gz" ] && mv "$OUT_DIR/trimmed_R2.fastq.gz" "$RAW/fastp/"
   [ -f "$OUT_DIR/fastp.json" ]          && mv "$OUT_DIR/fastp.json"          "$RAW/fastp/"
-  # SPAdes: ensure contigs.fasta is at RAW/spades/contigs.fasta
   if [ -f "$OUT_DIR/spades_out/contigs.fasta" ]; then
     mv "$OUT_DIR/spades_out/contigs.fasta" "$RAW/spades/contigs.fasta"
-    # keep the full SPAdes run dir
     mv "$OUT_DIR/spades_out" "$RAW/spades/run_spades_out"
   fi
-  # Kraken
   [ -f "$OUT_DIR/kraken_report.txt" ] && mv "$OUT_DIR/kraken_report.txt" "$RAW/kraken2/"
-  # BUSCO run dir (named run_<BUSCO_RUN>)
   if [ -d "$OUT_DIR/run_${BUSCO_RUN}" ]; then
     mv "$OUT_DIR/run_${BUSCO_RUN}" "$RAW/busco/"
   fi
-  # Mapping outputs
+  # mapping
   [ -f "$OUT_DIR/mapped.bam" ]            && mv "$OUT_DIR/mapped.bam"            "$RAW/mapping/"
   [ -f "$OUT_DIR/mapped.sorted.bam" ]     && mv "$OUT_DIR/mapped.sorted.bam"     "$RAW/mapping/"
   [ -f "$OUT_DIR/mapped.sorted.bam.bai" ] && mv "$OUT_DIR/mapped.sorted.bam.bai" "$RAW/mapping/"
   [ -f "$OUT_DIR/depth.txt" ]             && mv "$OUT_DIR/depth.txt"             "$RAW/mapping/"
-  # Pilon
+  # pilon
   [ -f "$OUT_DIR/pilon_corrected.fasta" ] && mv "$OUT_DIR/pilon_corrected.fasta" "$RAW/pilon/"
-  # Sourmash
+  # sourmash
   if [ -d "$OUT_DIR/contamination_checks/sourmash" ]; then
     mv "$OUT_DIR/contamination_checks/sourmash" "$RAW/sourmash/"
   fi
 
   # logs
-  [ -f "$OUT_DIR/fastp.log" ]                 && mv "$OUT_DIR/fastp.log"                 "$LOGS/"
-  [ -f "$OUT_DIR/spades.log" ]                && mv "$OUT_DIR/spades.log"                "$LOGS/"
-  [ -f "$OUT_DIR/kraken_output.txt" ]         && mv "$OUT_DIR/kraken_output.txt"         "$LOGS/"
-  [ -f "$OUT_DIR/NEW_busco_diag.log" ]        && mv "$OUT_DIR/NEW_busco_diag.log"        "$LOGS/"
-  [ -f "$BUSCO_LOG" ]                         && mv "$BUSCO_LOG"                         "$LOGS/"
-  [ -f "$OUT_DIR/pilon.log" ]                 && mv "$OUT_DIR/pilon.log"                 "$LOGS/"
-  # Attach scheduler logs via symlink (non-fatal if missing)
-  ln -sf "$HOME/logs/TESTOV54_pipeline.log" "$LOGS/TESTOV54_pipeline.log" || true
-  ln -sf "$HOME/logs/TESTOV54_pipeline.err" "$LOGS/TESTOV54_pipeline.err" || true
+  [ -f "$OUT_DIR/fastp.log" ]      && mv "$OUT_DIR/fastp.log"      "$LOGS/"
+  [ -f "$OUT_DIR/spades.log" ]     && mv "$OUT_DIR/spades.log"     "$LOGS/"
+  [ -f "$OUT_DIR/kraken_output.txt" ] && mv "$OUT_DIR/kraken_output.txt" "$LOGS/"
+  [ -f "$OUT_DIR/busco_diag.log" ] && mv "$OUT_DIR/busco_diag.log" "$LOGS/"
+  [ -f "$BUSCO_LOG" ]              && mv "$BUSCO_LOG"              "$LOGS/"
+  [ -f "$OUT_DIR/pilon.log" ]      && mv "$OUT_DIR/pilon.log"      "$LOGS/"
+  ln -sf "$HOME/logs/Enhanced_Pipeline_10.log" "$LOGS/Enhanced_Pipeline_10.log" || true
+  ln -sf "$HOME/logs/Enhanced_Pipeline_10.err" "$LOGS/Enhanced_Pipeline_10.err" || true
 
-  # graphs (leave single-page panel in OUT_DIR root as requested)
-  for f in "$OUT_DIR"/NEW_fig_*.png "$OUT_DIR"/NEW_summary_plots.pdf; do
+  # graphs (leave summary_panel.pdf and sample_report.pdf in OUT_DIR root)
+  for f in "$OUT_DIR"/fig_*.png "$OUT_DIR"/summary_plots.pdf; do
     [ -e "$f" ] && mv "$f" "$GRAPHS/"
   done
+  # remove temporary summary_page.pdf (kept merged), keep panel in root
+  [ -f "$OUT_DIR/summary_page.pdf" ] && rm -f "$OUT_DIR/summary_page.pdf"
 
-  echo "$sample finished successfully." >> "$OUT_ROOT/NEW_finished_samples.txt"
+  echo "$sample finished successfully." >> "$OUT_ROOT/finished_samples.txt"
 done
 
 # ===========================================
 # MASTER REPORT (aggregate across all samples)
 # ===========================================
-MASTER_DIR="$OUT_ROOT/NEW_master_report"
+MASTER_DIR="$OUT_ROOT/master_report"
 mkdir -p "$MASTER_DIR"
 
 source "$SHARED_VENV/bin/activate"
 
 python3 - << 'PY_MASTER'
-import os, glob, re, subprocess, gzip, json, shutil, datetime, textwrap
+import os, glob, re, subprocess, gzip, json, shutil, datetime
 import numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from Bio import SeqIO
 
-OUT_ROOT=os.path.expanduser("~/TESTOV54_out")
-MASTER_DIR=os.path.join(OUT_ROOT,"NEW_master_report")
+OUT_ROOT=os.environ.get('OUT_ROOT', os.path.expanduser('~/Enhanced_Pipeline_10_out'))
+MASTER_DIR=os.path.join(OUT_ROOT,"master_report")
 os.makedirs(MASTER_DIR, exist_ok=True)
-pdf_path=os.path.join(MASTER_DIR,"NEW_master_summary.pdf")
+pdf_path=os.path.join(MASTER_DIR,"master_summary.pdf")
 
 def ann(ax, text):
     ax.text(0.98,0.95,text,transform=ax.transAxes,ha="right",va="top",
@@ -611,6 +701,7 @@ def sample_fastq_means(path, max_reads=10000):
     means=[]; cnts=[]
     try:
         with gzip.open(path,"rt") as fh:
+            from Bio import SeqIO
             for i,rec in enumerate(SeqIO.parse(fh,"fastq"),1):
                 quals=rec.letter_annotations.get("phred_quality",[])
                 for k,q in enumerate(quals):
@@ -624,16 +715,14 @@ def sample_fastq_means(path, max_reads=10000):
     except Exception:
         return None
 
-sample_dirs=sorted(glob.glob(os.path.join(OUT_ROOT,"NEW_*_out")))
+sample_dirs=sorted(glob.glob(os.path.join(OUT_ROOT,"*_out")))
 for sdir in sample_dirs:
-    sample=os.path.basename(sdir).replace("_out","").replace("NEW_","")
+    sample=os.path.basename(sdir).replace("_out","")
 
-    # Paths (new layout first, fallback to legacy)
     fa = os.path.join(sdir,"raw_outputs","spades","contigs.fasta")
     if not os.path.exists(fa):
         fa = os.path.join(sdir,"spades_out","contigs.fasta")
 
-    # Assembly stats
     total=np.nan; n50=np.nan; ncontigs=np.nan
     if os.path.exists(fa):
         contigs=list(SeqIO.parse(fa,"fasta"))
@@ -645,17 +734,15 @@ for sdir in sample_dirs:
                 c+=L
                 if c>=total/2: n50=L; break
 
-    # BUSCO (latest log from logs/)
     busco={"Complete":np.nan,"Duplicated":np.nan,"Fragmented":np.nan,"Missing":np.nan}
-    blog_cands=sorted(glob.glob(os.path.join(sdir,"logs","NEW_busco_spades*.log")), key=os.path.getmtime, reverse=True)
+    blog_cands=sorted(glob.glob(os.path.join(sdir,"logs","busco_spades*.log")), key=os.path.getmtime, reverse=True)
     if blog_cands:
-        for line in open(blog_cands[0]):
+        for line in open(blog_cands[0], encoding='utf-8', errors='ignore'):
             m=re.search(r"C:(\d+\.\d+)%.*D:(\d+\.\d+)%.*F:(\d+\.\d+)%.*M:(\d+\.\d+)%",line)
             if m:
                 busco=dict(zip(["Complete","Duplicated","Fragmented","Missing"], map(float,m.groups())))
                 break
 
-    # Depth mean
     depthf=os.path.join(sdir,"raw_outputs","mapping","depth.txt")
     if not os.path.exists(depthf):
         depthf=os.path.join(sdir,"depth.txt")
@@ -666,7 +753,6 @@ for sdir in sample_dirs:
             mean_depth=d["depth"].mean()
         except: pass
 
-    # Kraken report -> series
     krep=os.path.join(sdir,"raw_outputs","kraken2","kraken_report.txt")
     if not os.path.exists(krep):
         krep=os.path.join(sdir,"kraken_report.txt")
@@ -678,13 +764,11 @@ for sdir in sample_dirs:
             kraken_series.append(ser)
         except: pass
 
-    # sourmash sig
     sig=os.path.join(sdir,"raw_outputs","sourmash","assembly.sig")
     if not os.path.exists(sig):
         sig=os.path.join(sdir,"contamination_checks","sourmash","assembly.sig")
     if os.path.exists(sig): sigs.append(sig)
 
-    # Read quality curves for aggregation
     fp=os.path.join(sdir,"raw_outputs","fastp","fastp.json")
     if not os.path.exists(fp): fp=os.path.join(sdir,"fastp.json")
     r1,r2=(None,None)
@@ -702,12 +786,11 @@ for sdir in sample_dirs:
     rows.append({"Sample":sample,"TotalLength":total,"N50":n50,"NumContigs":ncontigs,"DepthMean":mean_depth,**busco})
 
 df=pd.DataFrame(rows).set_index("Sample")
-df.to_csv(os.path.join(MASTER_DIR,"NEW_aggregated_metrics.csv"))
+df.to_csv(os.path.join(MASTER_DIR,"aggregated_metrics.csv"))
 
 with PdfPages(pdf_path) as pdf:
-    # PAGE 1: Japanese-styled overview (prettier, aligned)
-    fig,ax=plt.subplots(figsize=(8.5,11))
-    ax.axis('off')
+    # PAGE 1: Japanese-styled overview
+    fig,ax=plt.subplots(figsize=(8.5,11)); ax.axis('off')
     def stat_line(jp_label, series, fmt="{:.2f}"):
         s=series.dropna()
         if s.empty:
@@ -730,7 +813,7 @@ with PdfPages(pdf_path) as pdf:
     lines.append("")
     lines.append("＜集計統計量＞")
     lines.append(stat_line("アセンブリ総長 (Mb)", df['TotalLength']/1e6, "{:.2f}"))
-    lines.append(stat_line("N50 (kb)",          df['N50']/1e3,        "{:.1f}"))
+    lines.append(stat_line("N50 (Mb)",          df['N50']/1e6,        "{:.3f}"))
     lines.append(stat_line("コンティグ数",       df['NumContigs'],      "{:.0f}"))
     lines.append(stat_line("平均被覆深さ (×)",   df['DepthMean'],       "{:.1f}"))
     lines.append(stat_line("BUSCO 完全 (%)",     df['Complete'],        "{:.1f}"))
@@ -740,17 +823,16 @@ with PdfPages(pdf_path) as pdf:
     ax.text(0.06, 0.96, text, va='top', family='monospace', fontsize=11)
     pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 2: Aggregate read quality (mean line + min–max ribbons)
+    # PAGE 2: Aggregate read quality (mean + min–max)
+    r1_curves=[c for c in r1_curves if c.size>0]; r2_curves=[c for c in r2_curves if c.size>0]
     if len(r1_curves) + len(r2_curves) > 0:
         fig,ax=plt.subplots(figsize=(7,5))
-        # R1
         if r1_curves:
             L1=min(arr.shape[0] for arr in r1_curves)
             R1=np.stack([arr[:L1] for arr in r1_curves], axis=0)
             r1_mean=R1.mean(axis=0); r1_min=R1.min(axis=0); r1_max=R1.max(axis=0)
             ax.plot(np.arange(1,L1+1), r1_mean, label="R1 mean", color="blue")
             ax.fill_between(np.arange(1,L1+1), r1_min, r1_max, color="blue", alpha=0.12, label="R1 min–max")
-        # R2
         if r2_curves:
             L2=min(arr.shape[0] for arr in r2_curves)
             R2=np.stack([arr[:L2] for arr in r2_curves], axis=0)
@@ -759,57 +841,47 @@ with PdfPages(pdf_path) as pdf:
             ax.fill_between(np.arange(1,L2+1), r2_min, r2_max, color="orange", alpha=0.12, label="R2 min–max")
         ax.set_xlabel("塩基位置"); ax.set_ylabel("平均クオリティ"); ax.set_title("集計：リード品質（平均＋レンジ）")
         ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-        stats=[]
-        if len(r1_curves): stats.append(f"R1 μ={R1.mean():.1f} σ={R1.std():.1f} n={R1.shape[0]} L={L1}")
-        if len(r2_curves): stats.append(f"R2 μ={R2.mean():.1f} σ={R2.std():.1f} n={R2.shape[0]} L={L2}")
-        if stats: ann(ax," | ".join(stats))
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 3: N50 histogram
+    # N50 histogram
     if df['N50'].notna().any():
         fig,ax=plt.subplots(figsize=(7,5))
-        ax.hist(df['N50'].dropna()/1e3,bins=20,color='royalblue',edgecolor='black',alpha=0.85)
-        ax.set_xlabel("N50 (kb)"); ax.set_ylabel("Count"); ax.set_title("N50 分布")
-        s=df['N50'].dropna()/1e3; ann(ax, f"Mean={s.mean():.1f}  Med={s.median():.1f}  SD={s.std():.1f}")
+        ax.hist(df['N50'].dropna()/1e6,bins=20,color='royalblue',edgecolor='black',alpha=0.85)
+        ax.set_xlabel("N50 (Mb)"); ax.set_ylabel("Count"); ax.set_title("N50 分布")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 4: Total assembly length histogram
+    # Total assembly length histogram
     if df['TotalLength'].notna().any():
         fig,ax=plt.subplots(figsize=(7,5))
         ax.hist((df['TotalLength'].dropna()/1e6),bins=20,color='darkorange',edgecolor='black',alpha=0.85)
         ax.set_xlabel("アセンブリ総長 (Mb)"); ax.set_ylabel("Count"); ax.set_title("アセンブリ総長 分布")
-        s=df['TotalLength'].dropna()/1e6; ann(ax, f"Mean={s.mean():.2f}  Med={s.median():.2f}  SD={s.std():.2f}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 5: BUSCO box-and-whisker
+    # BUSCO box-and-whisker (Complete / Duplicated / Fragmented)
     b=df[['Complete','Duplicated','Fragmented']].dropna(how='all')
     if not b.empty:
         fig,ax=plt.subplots(figsize=(7,5))
         sns.boxplot(data=b, palette=['forestgreen','royalblue','tomato'], ax=ax)
         ax.set_ylabel("Percent"); ax.set_title("BUSCO 分布（Complete / Duplicated / Fragmented）")
-        c=b['Complete'].dropna(); d=b['Duplicated'].dropna(); f=b['Fragmented'].dropna()
-        ann(ax, f"C μ={c.mean():.1f} σ={c.std():.1f} | D μ={d.mean():.1f} | F μ={f.mean():.1f}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 6: Number of contigs histogram
+    # Number of contigs histogram
     if df['NumContigs'].notna().any():
         fig,ax=plt.subplots(figsize=(7,5))
         ax.hist(df['NumContigs'].dropna(),bins=20,color='purple',edgecolor='black',alpha=0.85)
         ax.set_xlabel("コンティグ数"); ax.set_ylabel("Count"); ax.set_title("コンティグ数 分布")
-        s=df['NumContigs'].dropna(); ann(ax, f"Mean={s.mean():.0f}  Med={s.median():.0f}  SD={s.std():.0f}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 7: Coverage depth histogram
+    # Coverage depth histogram
     if df['DepthMean'].notna().any():
         fig,ax=plt.subplots(figsize=(7,5))
         ax.hist(df['DepthMean'].dropna(),bins=20,color='seagreen',edgecolor='black',alpha=0.85)
         ax.set_xlabel("平均被覆深さ (×)"); ax.set_ylabel("Count"); ax.set_title("被覆深さ 分布")
-        s=df['DepthMean'].dropna(); ann(ax, f"Mean={s.mean():.1f}  Med={s.median():.1f}  SD={s.std():.1f}")
         fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
 
-    # PAGE 8: Sourmash similarity heatmap
+    # Sourmash similarity heatmap
     if len(sigs) >= 2:
-        matrix_file=os.path.join(MASTER_DIR,"NEW_sourmash_similarity.tsv")
+        matrix_file=os.path.join(MASTER_DIR,"sourmash_similarity.tsv")
         sif=os.path.expanduser("~/sif_images/sourmash.sif")
         cmd=["singularity","exec",sif,"sourmash","compare"]+sigs+["-o",matrix_file]
         subprocess.call(cmd)
@@ -822,12 +894,10 @@ with PdfPages(pdf_path) as pdf:
         except Exception:
             pass
 
-    # PAGE 9: Kraken abundance heatmap (top 20 taxa)
-    # (No bar chart in master; just heatmap)
-    sample_dirs=sorted(glob.glob(os.path.join(OUT_ROOT,"NEW_*_out")))
+    # Kraken abundance heatmap (top 20 taxa)
     kr_series=[]
     for sdir in sample_dirs:
-        sample=os.path.basename(sdir).replace("_out","").replace("NEW_","")
+        sample=os.path.basename(sdir).replace("_out","")
         krep=os.path.join(sdir,"raw_outputs","kraken2","kraken_report.txt")
         if not os.path.exists(krep):
             krep=os.path.join(sdir,"kraken_report.txt")
@@ -841,7 +911,7 @@ with PdfPages(pdf_path) as pdf:
     if kr_series:
         kdf=pd.concat(kr_series, axis=1).fillna(0)
         top20=kdf.mean(axis=1).sort_values(ascending=False).head(20).index
-        mat=kdf.loc[top20].T  # samples x taxa
+        mat=kdf.loc[top20].T
         fig,ax=plt.subplots(figsize=(8,6))
         sns.heatmap(mat, cmap='coolwarm', ax=ax, cbar_kws={'label':'% reads'})
         ax.set_xlabel("Taxon"); ax.set_ylabel("Sample"); ax.set_title("Kraken2 相対存在量（上位分類）")
@@ -854,7 +924,7 @@ os.makedirs(qdir, exist_ok=True)
 if 'Complete' in df.columns:
     top=df['Complete'].dropna().sort_values(ascending=False).head(6)
     for samp,score in top.items():
-        sdir=[d for d in sample_dirs if d.endswith(f"NEW_{samp}_out")]
+        sdir=[d for d in sample_dirs if d.endswith(f"{samp}_out")]
         if not sdir: continue
         sdir=sdir[0]
         dest=os.path.join(qdir, samp)
@@ -883,4 +953,4 @@ PY_MASTER
 
 deactivate || true
 
-echo "All samples complete; per-sample figures, summaries, and master report generated."
+echo "All samples complete; per-sample combined PDFs, summaries, and master report generated."
