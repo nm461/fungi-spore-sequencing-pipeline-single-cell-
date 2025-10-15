@@ -1,4 +1,5 @@
 #!/bin/bash
+#$ -S /bin/bash
 #$ -N coassembly_sequential
 #$ -cwd
 #$ -o coassembly_sequential.out
@@ -26,11 +27,22 @@ THREADS="${NSLOTS:-8}"
 # =========================
 # Paths (adjust if needed)
 # =========================
-OUT_ROOT="${OUT_ROOT:-$HOME/Enhanced_Pipeline_10_out}"                                      ####IMPORTANT: That path must be the same directory where your master pipeline wrote: master_report/aggregated_metrics.csv
-SIF_DIR="${SIF_DIR:-$HOME/sif_images}"
-DB_DIR="${DB_DIR:-$HOME/databases/kraken2_plusPFP_16G/k2_pluspfp_16G}"       # Kraken2 DB
-BUSCO_LINEAGE="${BUSCO_LINEAGE:-$HOME/fungi_odb10}"                           # BUSCO lineage
-SM_DB="${SM_DB:-$HOME/databases/sourmash/fungi/genbank-2022.03-fungi-k21.zip}"
+
+# IMPORTANT: This must be the same directory where your master pipeline wrote master_report/aggregated_metrics.csv
+OUT_ROOT="$HOME/Enhanced_Pipeline_10_3_out"
+
+# Singularity images
+SIF_DIR="$HOME/sif_images"
+
+# Kraken2 database
+DB_DIR="$HOME/databases/kraken2_plusPFP_16G/k2_pluspfp_16G"
+
+# BUSCO lineage dataset
+BUSCO_LINEAGE="$HOME/fungi_odb10"
+
+# Sourmash database
+SM_DB="$HOME/databases/sourmash/fungi/genbank-2022.03-fungi-k21.zip"
+
 
 COA_DIR="$OUT_ROOT/co-assembly"
 TOP_DIR="$COA_DIR/top_samples"
@@ -39,6 +51,8 @@ MASTER_DIR="$OUT_ROOT/master_report"
 METRICS_CSV="$MASTER_DIR/aggregated_metrics.csv"
 
 mkdir -p "$COA_DIR" "$TOP_DIR" "$SEQ_DIR"/{double,triple,quadruple,pentuple,sextuple} "$COA_DIR/tools"
+
+export OUT_ROOT SIF_DIR DB_DIR BUSCO_LINEAGE SM_DB
 
 # =========================
 # Python virtual environment
@@ -59,7 +73,8 @@ source "$SHARED_VENV/bin/activate"
 python3 - << 'PY_SELECT'
 import os, pandas as pd, shutil, sys
 
-OUT_ROOT = os.environ.get("OUT_ROOT", os.path.expanduser("~/Enhanced_Pipeline_10_out"))
+# Also need to change this outroot depending on your asssembly run
+OUT_ROOT = os.environ.get("OUT_ROOT", os.path.expanduser("~/Enhanced_Pipeline_10_3out"))                                        
 COA_DIR  = os.path.join(OUT_ROOT, "co-assembly")
 TOP_DIR  = os.path.join(COA_DIR, "top_samples")
 MASTER   = os.path.join(OUT_ROOT, "master_report")
