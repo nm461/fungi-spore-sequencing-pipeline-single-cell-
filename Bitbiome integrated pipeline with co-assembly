@@ -1,0 +1,850 @@
+#!/bin/bash
+#$ -N NewPipelineCNTWDeep1
+#$ -cwd
+#$ -l h_rt=120:00:00
+#$ -l s_vmem=16G,mem_req=16G
+#$ -pe def_slot 8
+#$ -o /home/nm461/CNTW_Deep/251209_VH00335_175_AAGKYTJM5/Analysis/1/Data/fastq/NewPipelineCNTWDeep.out
+#$ -e /home/nm461/CNTW_Deep/251209_VH00335_175_AAGKYTJM5/Analysis/1/Data/fastq/NewPipelineCNTWDeep.log
+
+set -e
+set -x
+
+# =========================
+# Modules
+# =========================
+module use /usr/local/package/modulefiles
+module load apptainer
+module load blast+/2.15.0
+module load repeatmasker/4.1.6 || true   # harmless; RepeatMasker is skipped
+
+export PATH="$HOME/tools/rmblast/rmblast-2.14.1/bin:$PATH"
+
+# =========================
+# Directories & inputs
+# =========================
+OUT_ROOT="$HOME/CNTW_Deep/251209_VH00335_175_AAGKYTJM5/Analysis/1/Data/fastq/NewPipelineOut"
+SIF_DIR="$HOME/sif_images"
+DATA_DIR="$HOME/CNTW_Deep/251209_VH00335_175_AAGKYTJM5/Analysis/1/Data/fastq"
+DB_DIR="$HOME/databases/kraken2_plusPFP_16G/k2_pluspfp_16G"   # Kraken2 DB dir (contains *.k2d)
+BUSCO_LINEAGE="$HOME/fungi_odb10"                              # BUSCO lineage dir
+MULTIQC_CUSTOM="$HOME/multiqc_custom"
+SM_DB="$HOME/databases/sourmash/fungi/genbank-2022.03-fungi-k21.zip"
+
+# Limit how many samples to run this time
+MAX_SAMPLES=16
+
+mkdir -p "$OUT_ROOT"
+export SIF_DIR
+export OUT_ROOT
+
+# =========================
+# Shared Python venv (once)
+# =========================
+SHARED_VENV="$OUT_ROOT/shared_venv"
+if [ ! -d "$SHARED_VENV" ]; then
+  python3 -m venv "$SHARED_VENV"
+  source "$SHARED_VENV/bin/activate"
+  pip install --upgrade pip
+  pip install --no-cache-dir pandas numpy matplotlib seaborn biopython scipy PyPDF2
+  deactivate
+fi
+
+# =========================
+# MAIN LOOP OVER SAMPLES (capped at MAX_SAMPLES)
+# =========================
+processed=0
+for R1 in "$DATA_DIR"/*_R1_001.fastq.gz; do
+  if [ "$processed" -ge "$MAX_SAMPLES" ]; then
+    echo "Reached MAX_SAMPLES=$MAX_SAMPLES; stopping."
+    break
+  fi
+
+  sample=$(basename "$R1" _R1_001.fastq.gz)
+  R2="$DATA_DIR/${sample}_R2_001.fastq.gz"
+  if [ ! -f "$R2" ]; then
+    echo "WARNING: missing R2 for sample $sample — skipping."
+    continue
+  fi
+
+  processed=$((processed + 1))
+  OUT_DIR="$OUT_ROOT/${sample}_out"
+  mkdir -p "$OUT_DIR"
+  echo "==== Processing $sample ===="
+
+  # ---------- 1. Fastp ----------
+  singularity exec "$SIF_DIR/fastp.sif" fastp \
+    -i "$R1" -I "$R2" \
+    -o "$OUT_DIR/trimmed_R1.fastq.gz" \
+    -O "$OUT_DIR/trimmed_R2.fastq.gz" \
+    --thread "$NSLOTS" \
+    --length_required 100 \
+    --json "$OUT_DIR/fastp.json" \
+    > "$OUT_DIR/fastp.log" 2>&1
+
+  # ---------- 1.5 Optional: Host decontamination (BWA) ----------
+  HOST_REF="$HOME/databases/human_masked/human_masked.fasta"
+
+  if [ -f "$HOST_REF" ]; then
+      echo "Running host decontamination using BWA..."
+
+      # Map trimmed reads to host
+      singularity exec "$SIF_DIR/bwa.sif" bwa mem -t "$NSLOTS" \
+          "$HOST_REF" "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
+        | singularity exec "$SIF_DIR/samtools.sif" samtools view -bS - \
+        > "$OUT_DIR/host_mapped.bam"
+
+      # Keep only UNMAPPED read pairs (remove host)
+      singularity exec "$SIF_DIR/samtools.sif" samtools view -b -f 12 -F 256 \
+          "$OUT_DIR/host_mapped.bam" > "$OUT_DIR/clean_unmapped.bam"
+
+      # Convert BAM → FASTQ
+      singularity exec "$SIF_DIR/samtools.sif" samtools fastq \
+          -1 "$OUT_DIR/clean_R1.fastq.gz" \
+          -2 "$OUT_DIR/clean_R2.fastq.gz" \
+          -0 /dev/null -s /dev/null -n \
+          "$OUT_DIR/clean_unmapped.bam"
+
+      R1_CLEAN="$OUT_DIR/clean_R1.fastq.gz"
+      R2_CLEAN="$OUT_DIR/clean_R2.fastq.gz"
+  else
+      echo "Host reference not found — skipping host decontam."
+      R1_CLEAN="$OUT_DIR/trimmed_R1.fastq.gz"
+      R2_CLEAN="$OUT_DIR/trimmed_R2.fastq.gz"
+  fi
+
+  # ---------- 2. SPAdes (single-cell mode) ----------
+  export PATH=~/coassembly/bin/SPAdes-4.2.0-Linux/bin:$PATH
+  spades.py \
+    --sc \
+    -1 "$R1_CLEAN" \
+    -2 "$R2_CLEAN" \
+    -o "$OUT_DIR/spades_out" \
+    --threads "$NSLOTS" \
+    --memory 120 \
+    > "$OUT_DIR/spades.log" 2>&1
+
+  ASSEMBLY="$OUT_DIR/spades_out/contigs.fasta"
+
+  # ---------- 3. Kraken2 ----------
+  singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
+    --db "$DB_DIR" \
+    --report "$OUT_DIR/kraken_report.txt" \
+    --paired "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
+    --threads "$NSLOTS" \
+    > "$OUT_DIR/kraken_output.txt" 2>&1
+
+  # ---------- 4. BWA/Samtools ----------
+  singularity exec "$SIF_DIR/bwa.sif" bwa index "$ASSEMBLY"
+  singularity exec "$SIF_DIR/bwa.sif" bwa mem -t "$NSLOTS" \
+    "$ASSEMBLY" "$R1_CLEAN" "$R2_CLEAN" \
+    | singularity exec "$SIF_DIR/samtools.sif" samtools view -bS - \
+    > "$OUT_DIR/mapped.bam"
+
+  singularity exec "$SIF_DIR/samtools.sif" samtools sort -@ "$NSLOTS" \
+    -o "$OUT_DIR/mapped.sorted.bam" "$OUT_DIR/mapped.bam"
+
+  singularity exec "$SIF_DIR/samtools.sif" samtools index "$OUT_DIR/mapped.sorted.bam"
+
+  # ---------- 5. Pilon ----------
+  singularity exec "$SIF_DIR/pilon.sif" java -Xmx120G -jar /pilon/pilon.jar \
+    --genome "$ASSEMBLY" \
+    --frags "$OUT_DIR/mapped.sorted.bam" \
+    --output "$OUT_DIR/pilon_corrected" \
+    --threads "$NSLOTS" \
+    > "$OUT_DIR/pilon.log" 2>&1
+
+  PILON_ASSEMBLY="$OUT_DIR/pilon_corrected.fasta"
+
+  # ---------- 5.5 Contig filtering (>= 1000 bp, using seqkit SIF if available) ----------
+  FILTERED_ASSEMBLY="$PILON_ASSEMBLY"
+  SEQKIT_SIF="$SIF_DIR/seqkit.sif"
+
+  if [ -f "$SEQKIT_SIF" ]; then
+    echo "Filtering contigs < 1000 bp using seqkit (via SIF)..."
+    singularity exec "$SEQKIT_SIF" seqkit seq -m 1000 "$PILON_ASSEMBLY" > "$OUT_DIR/pilon_corrected.1kb.fasta"
+    FILTERED_ASSEMBLY="$OUT_DIR/pilon_corrected.1kb.fasta"
+  else
+    echo "Seqkit SIF not found at $SEQKIT_SIF — skipping contig length filter."
+  fi
+
+  # ---------- 6. BUSCO (on polished, filtered assembly, with diagnostics) ----------
+  export OMP_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+
+  TS=$(date +%Y%m%d%H%M%S)
+  BUSCO_RUN="busco_pilon_${TS}"
+  BUSCO_LOG="$OUT_DIR/${BUSCO_RUN}.log"
+
+  {
+    echo "=== BUSCO preflight for $sample ==="
+    date
+    echo "ASSEMBLY (Pilon-corrected, filtered if available): $FILTERED_ASSEMBLY"; ls -lh "$FILTERED_ASSEMBLY" || true
+    echo "BUSCO_LINEAGE: $BUSCO_LINEAGE"; ls -lh "$BUSCO_LINEAGE" | head || true
+    singularity exec -B "$OUT_DIR:$OUT_DIR" "$SIF_DIR/busco_v6.0.0_cv1.sif" bash -lc '
+      echo "busco version:"; busco --version || true
+      echo "pwd: $(pwd)"
+    ' || true
+  } > "$OUT_DIR/busco_diag.log" 2>&1
+
+  singularity exec -B "$OUT_DIR:$OUT_DIR" "$SIF_DIR/busco_v6.0.0_cv1.sif" \
+    busco \
+      -i "$FILTERED_ASSEMBLY" \
+      -o "$BUSCO_RUN" \
+      -l "$BUSCO_LINEAGE" \
+      -m genome \
+      --cpu 2 \
+      --out_path "$OUT_DIR" \
+    > "$BUSCO_LOG" 2>&1
+
+  # ---------- 7. Sourmash ----------
+  SM_OUT="$OUT_DIR/contamination_checks/sourmash"
+  mkdir -p "$SM_OUT"
+  SIF_SM="$SIF_DIR/sourmash.sif"
+
+  singularity exec "$SIF_SM" sourmash sketch dna -p k=21,scaled=1000 \
+    -o "$SM_OUT/assembly.sig" "$FILTERED_ASSEMBLY"
+
+  singularity exec "$SIF_SM" sourmash gather \
+    "$SM_OUT/assembly.sig" "$SM_DB" \
+    -o "$SM_OUT/gather_results.csv"
+
+  # ---------- 8. Per-sample text report (PDF) + CSV metrics + GraphData CSVs ----------
+  source "$SHARED_VENV/bin/activate"
+  export OUT_DIR OUT_ROOT SIF_DIR sample
+  python3 - << 'PY_PER_SAMPLE'
+import os, json, re, glob, datetime, csv, subprocess
+import numpy as np
+import pandas as pd
+from Bio import SeqIO
+import matplotlib.pyplot as plt
+from matplotlib import font_manager as fm
+ddf = None        # depth dataframe (coverage)
+kdf = None        # kraken report dataframe
+
+OUT_DIR  = os.environ.get("OUT_DIR", "")
+OUT_ROOT = os.environ.get("OUT_ROOT", "")
+SIF_DIR  = os.path.expanduser(os.environ.get("SIF_DIR", "~/sif_images"))
+SAMPLE   = os.environ.get("sample", "")
+
+if not OUT_DIR or not OUT_ROOT or not SAMPLE:
+    raise SystemExit("OUT_DIR / OUT_ROOT / sample not set")
+
+# ---------- pick a font (for PDF text) ----------
+def pick_font():
+    preferred = [
+        "DejaVu Sans", "Arial", "Liberation Sans",
+        "Noto Sans", "Noto Sans CJK JP"
+    ]
+    paths = fm.findSystemFonts(fontext="ttf") + fm.findSystemFonts(fontext="ttc")
+    names = {}
+    for p in paths:
+        try:
+            names[fm.get_font(p).family_name] = p
+        except Exception:
+            pass
+    for name in preferred:
+        if name in names:
+            return fm.FontProperties(fname=names[name])
+    return None
+
+FONT = pick_font()
+
+# ---------- ensure depth.txt exists ----------
+def ensure_depth():
+    depth = os.path.join(OUT_DIR, "depth.txt")
+    bam   = os.path.join(OUT_DIR, "mapped.sorted.bam")
+    sif   = os.path.join(SIF_DIR, "samtools.sif")
+    if os.path.exists(depth):
+        return depth
+    if os.path.exists(bam) and os.path.exists(sif):
+        with open(depth, "w") as out:
+            subprocess.call(
+                ["singularity", "exec", sif, "samtools", "depth", "-a", bam],
+                stdout=out
+            )
+        return depth
+    return None
+
+# ---------- fastp summary ----------
+fjson = os.path.join(OUT_DIR, "fastp.json")
+q30 = None
+r1len = None
+r2len = None
+pairs_before = None
+pairs_after  = None
+
+if os.path.exists(fjson):
+    try:
+        jj = json.load(open(fjson))
+        summary = jj.get("summary", {})
+        before  = summary.get("before_filtering", {})
+        after   = summary.get("after_filtering", {})
+        q30     = after.get("q30_rate")
+        r1len   = after.get("read1_mean_length")
+        r2len   = after.get("read2_mean_length")
+        pairs_before = before.get("total_reads")
+        pairs_after  = after.get("total_reads")
+    except Exception:
+        pass
+
+# ---------- assembly stats (final assembly) ----------
+fa_candidates = [
+    os.path.join(OUT_DIR, "pilon_corrected.1kb.fasta"),
+    os.path.join(OUT_DIR, "pilon_corrected.fasta"),
+    os.path.join(OUT_DIR, "spades_out", "contigs.fasta"),
+]
+assembly_path = next((p for p in fa_candidates if os.path.exists(p)), None)
+
+total_len = np.nan
+n50 = np.nan
+max_ctg = np.nan
+n_contigs = np.nan
+
+if assembly_path:
+    lens = [len(rec.seq) for rec in SeqIO.parse(assembly_path, "fasta")]
+    if lens:
+        n_contigs = len(lens)
+        total_len = float(sum(lens))
+        max_ctg   = float(max(lens))
+        s = sorted(lens, reverse=True)
+        csum = 0
+        half = total_len / 2.0
+        for L in s:
+            csum += L
+            if csum >= half:
+                n50 = float(L)
+                break
+
+# ---------- BUSCO (pilon) ----------
+busco_c = busco_d = busco_f = busco_m = np.nan
+busco_n = np.nan
+
+log_cands = sorted(
+    glob.glob(os.path.join(OUT_DIR, "busco_pilon_*.log")),
+    key=os.path.getmtime,
+    reverse=True
+)
+if log_cands:
+    blog = log_cands[0]
+    for line in open(blog, encoding="utf-8", errors="ignore"):
+        m = re.search(
+            r"C:(\d+\.\d+)%.*D:(\d+\.\d+)%.*F:(\d+\.\d+)%.*M:(\d+\.\d+)%.*n:(\d+)",
+            line
+        )
+        if m:
+            c, d, f, m_, n = m.groups()
+            busco_c = float(c)
+            busco_d = float(d)
+            busco_f = float(f)
+            busco_m = float(m_)
+            busco_n = int(n)
+            break
+
+# ---------- depth stats ----------
+depth_path = ensure_depth()
+depth_mean = depth_median = np.nan
+if depth_path and os.path.exists(depth_path):
+    try:
+        ddf = pd.read_csv(depth_path, sep="\t", header=None,
+                          names=["contig", "pos", "depth"])
+        depth_mean   = float(ddf["depth"].mean())
+        depth_median = float(ddf["depth"].median())
+    except Exception:
+        pass
+
+# ---------- Kraken top 5 ----------
+krep = os.path.join(OUT_DIR, "kraken_report.txt")
+kraken_top = []
+if os.path.exists(krep):
+    try:
+        kdf = pd.read_csv(
+            krep, sep="\t", header=None,
+            names=["perc","reads","tax_reads","rank","taxid","name"]
+        )
+        kdf["name"] = kdf["name"].astype(str).str.strip()
+        top = kdf.sort_values("perc", ascending=False).head(5)
+        for _, r in top.iterrows():
+            kraken_top.append((r["name"], float(r["perc"])))
+    except Exception:
+        pass
+
+# ---------- write per-sample kraken_top5.csv ----------
+if kraken_top:
+    kt_path = os.path.join(OUT_DIR, "kraken_top5.csv")
+    os.makedirs(os.path.dirname(kt_path), exist_ok=True)
+    with open(kt_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Taxon", "Percent_reads"])
+        for name, perc in kraken_top:
+            w.writerow([name, perc])
+
+# ---------- write per-sample metrics CSV ----------
+sample_metrics_path = os.path.join(OUT_DIR, "sample_metrics.csv")
+cols = [
+    "Sample",
+    "Assembly_path",
+    "TotalLength_bp",
+    "N50_bp",
+    "MaxContig_bp",
+    "NumContigs",
+    "BUSCO_Complete",
+    "BUSCO_Duplicated",
+    "BUSCO_Fragmented",
+    "BUSCO_Missing",
+    "BUSCO_n",
+    "Depth_mean",
+    "Depth_median",
+    "Fastp_Q30_rate",
+    "Fastp_R1_mean_len",
+    "Fastp_R2_mean_len",
+    "Reads_before",
+    "Reads_after",
+]
+row = {
+    "Sample": SAMPLE,
+    "Assembly_path": assembly_path or "",
+    "TotalLength_bp": total_len,
+    "N50_bp": n50,
+    "MaxContig_bp": max_ctg,
+    "NumContigs": n_contigs,
+    "BUSCO_Complete": busco_c,
+    "BUSCO_Duplicated": busco_d,
+    "BUSCO_Fragmented": busco_f,
+    "BUSCO_Missing": busco_m,
+    "BUSCO_n": busco_n,
+    "Depth_mean": depth_mean,
+    "Depth_median": depth_median,
+    "Fastp_Q30_rate": float(q30) if q30 is not None else np.nan,
+    "Fastp_R1_mean_len": float(r1len) if r1len is not None else np.nan,
+    "Fastp_R2_mean_len": float(r2len) if r2len is not None else np.nan,
+    "Reads_before": int(pairs_before) if pairs_before is not None else np.nan,
+    "Reads_after": int(pairs_after) if pairs_after is not None else np.nan,
+}
+
+with open(sample_metrics_path, "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=cols)
+    w.writeheader()
+    w.writerow(row)
+
+# ---------- append to global master_metrics.csv ----------
+master_path = os.path.join(OUT_ROOT, "master_metrics.csv")
+write_header = not os.path.exists(master_path)
+with open(master_path, "a", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=cols)
+    if write_header:
+        w.writeheader()
+    w.writerow(row)
+
+# ------------------------------------------------------------
+# GRAPH DATA CSV EXPORTS (per graph type)
+# ------------------------------------------------------------
+
+GDIR = os.path.join(OUT_DIR, "GraphData")
+os.makedirs(GDIR, exist_ok=True)
+
+dirs = {
+    "ReadQuality": os.path.join(GDIR, "ReadQuality"),
+    "ContigLengths": os.path.join(GDIR, "ContigLengths"),
+    "AssemblyStats": os.path.join(GDIR, "AssemblyStats"),
+    "BUSCO": os.path.join(GDIR, "BUSCO"),
+    "Coverage": os.path.join(GDIR, "Coverage"),
+    "Kraken": os.path.join(GDIR, "Kraken"),
+    "CleanSize_vs_BUSCO": os.path.join(GDIR, "CleanSize_vs_BUSCO"),
+}
+for d in dirs.values():
+    os.makedirs(d, exist_ok=True)
+
+# 1. Contig lengths
+cl_csv = os.path.join(dirs["ContigLengths"], f"{SAMPLE}_contigs.csv")
+if assembly_path:
+    with open(cl_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["contig_id", "length_bp"])
+        for rec in SeqIO.parse(assembly_path, "fasta"):
+            w.writerow([rec.id, len(rec.seq)])
+
+# 2. Assembly stats
+as_csv = os.path.join(dirs["AssemblyStats"], f"{SAMPLE}_assembly_stats.csv")
+with open(as_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["metric", "value"])
+    w.writerow(["TotalLength_bp", total_len])
+    w.writerow(["N50_bp", n50])
+    w.writerow(["MaxContig_bp", max_ctg])
+    w.writerow(["NumContigs", n_contigs])
+
+# 3. BUSCO metrics
+busco_csv = os.path.join(dirs["BUSCO"], f"{SAMPLE}_busco.csv")
+with open(busco_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["Complete", "Duplicated", "Fragmented", "Missing", "n"])
+    w.writerow([busco_c, busco_d, busco_f, busco_m, busco_n])
+
+# 4. Coverage depth
+cov_csv = os.path.join(dirs["Coverage"], f"{SAMPLE}_coverage.csv")
+if ddf is not None:
+    ddf.to_csv(cov_csv, index=False)
+
+# 5. Kraken top taxa
+kr_csv = os.path.join(dirs["Kraken"], f"{SAMPLE}_kraken_top10.csv")
+if kdf is not None:
+    kdf_sorted = kdf.sort_values("perc", ascending=False).head(10)
+    kdf_sorted[["name", "perc"]].to_csv(kr_csv, index=False)
+
+# 6. Clean Size vs BUSCO completeness
+csb_csv = os.path.join(dirs["CleanSize_vs_BUSCO"], f"{SAMPLE}_cleanSize_busco.csv")
+with open(csb_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["Sample", "CleanSize_bp", "BUSCO_Complete"])
+    w.writerow([SAMPLE, total_len, busco_c])
+
+# ---------- build English summary text ----------
+lines = []
+lines.append("=== Sample summary / TESTOV54 pipeline ===")
+lines.append(f"Sample ID          : {SAMPLE}")
+lines.append(f"Run time           : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+lines.append(f"Output directory   : {OUT_DIR}")
+lines.append("")
+lines.append("== Input & trimming (fastp) ==")
+if os.path.exists(fjson):
+    lines.append(f"fastp JSON         : {fjson}")
+if pairs_before is not None and pairs_after is not None:
+    drop = 100.0 * (pairs_before - pairs_after) / max(1.0, pairs_before)
+    lines.append(f"Reads (before→after): {int(pairs_before):,} → {int(pairs_after):,}  (-{drop:.1f}%)")
+if q30 is not None:
+    lines.append(f"Q30 base fraction  : {100.0*float(q30):.1f}%")
+if r1len is not None and r2len is not None:
+    lines.append(f"Mean read length   : R1={float(r1len):.1f} bp, R2={float(r2len):.1f} bp")
+
+lines.append("")
+lines.append("== Assembly (final) ==")
+if assembly_path:
+    lines.append(f"Assembly used      : {assembly_path}")
+if not np.isnan(total_len):
+    lines.append(f"Total length       : {total_len/1e6:.2f} Mb")
+if not np.isnan(n50):
+    lines.append(f"N50                : {n50/1e6:.3f} Mb")
+if not np.isnan(max_ctg):
+    lines.append(f"Max contig         : {max_ctg/1e6:.3f} Mb")
+if not np.isnan(n_contigs):
+    lines.append(f"Number of contigs  : {int(n_contigs):,}")
+
+lines.append("")
+lines.append("== BUSCO (fungi_odb10) ==")
+if not np.isnan(busco_c):
+    lines.append(f"Complete           : {busco_c:.1f}%")
+    lines.append(f"  └ Duplicated     : {busco_d:.1f}%")
+    lines.append(f"Fragmented         : {busco_f:.1f}%")
+    lines.append(f"Missing            : {busco_m:.1f}%")
+    if not np.isnan(busco_n):
+        lines.append(f"Dataset size (n)   : {int(busco_n)}")
+else:
+    lines.append("BUSCO              : no result found")
+
+lines.append("")
+lines.append("== Mapping & coverage (BWA / samtools) ==")
+if not np.isnan(depth_mean):
+    lines.append(f"Mean coverage      : {depth_mean:.1f}×")
+if not np.isnan(depth_median):
+    lines.append(f"Median coverage    : {depth_median:.1f}×")
+lines.append("BAM                : raw_outputs/mapping/mapped.sorted.bam")
+lines.append("Depth table        : raw_outputs/mapping/depth.txt")
+
+lines.append("")
+lines.append("== Kraken2 top taxa ==")
+if kraken_top:
+    for name, perc in kraken_top:
+        lines.append(f"{name:30s} {perc:5.1f}%")
+else:
+    lines.append("No Kraken2 report / no taxa.")
+
+lines.append("")
+lines.append("== Other outputs ==")
+lines.append("Pilon assembly     : raw_outputs/pilon/pilon_corrected.fasta")
+lines.append("Sourmash           : raw_outputs/sourmash/assembly.sig, gather_results.csv")
+
+summary_txt_path = os.path.join(OUT_DIR, "summary.txt")
+with open(summary_txt_path, "w", encoding="utf-8") as w:
+    w.write("\n".join(lines))
+
+# ---------- turn summary.txt into a 1-page PDF (text only) ----------
+summary_pdf = os.path.join(OUT_DIR, "sample_report.pdf")
+text = "\n".join(lines)
+
+fig, ax = plt.subplots(figsize=(8.5, 11))
+ax.axis("off")
+if FONT:
+    ax.text(0.06, 0.96, text, va="top", ha="left",
+            fontproperties=FONT, fontsize=10, linespacing=1.2)
+else:
+    ax.text(0.06, 0.96, text, va="top", ha="left",
+            family="monospace", fontsize=9, linespacing=1.2)
+fig.tight_layout()
+fig.savefig(summary_pdf, dpi=300)
+plt.close(fig)
+
+print(f"[{SAMPLE}] summary.txt        -> {summary_txt_path}")
+print(f"[{SAMPLE}] sample_report.pdf  -> {summary_pdf}")
+print(f"[{SAMPLE}] sample_metrics.csv -> {sample_metrics_path}")
+print(f"[{SAMPLE}] master_metrics.csv -> {master_path} (append)")
+PY_PER_SAMPLE
+  deactivate
+done
+
+# =========================================
+# CO-ASSEMBLY (sequential) SECTION
+# =========================================
+
+THREADS="${NSLOTS:-8}"
+
+COA_DIR="$OUT_ROOT/co-assembly"
+TOP_DIR="$COA_DIR/top_samples"
+SEQ_DIR="$COA_DIR/sequential_assemblies"
+
+mkdir -p "$COA_DIR" "$TOP_DIR" "$SEQ_DIR"
+
+export OUT_ROOT SIF_DIR DB_DIR BUSCO_LINEAGE SM_DB
+
+# =========================
+# Step 1: Select Top 6 Samples by BUSCO_Complete
+# =========================
+source "$SHARED_VENV/bin/activate"
+python3 - << 'PY_SELECT'
+import os, pandas as pd, shutil, sys
+
+OUT_ROOT = os.environ.get("OUT_ROOT", os.path.expanduser("~/Enhanced_Pipeline_10_out"))
+COA_DIR  = os.path.join(OUT_ROOT, "co-assembly")
+TOP_DIR  = os.path.join(COA_DIR, "top_samples")
+CSV      = os.path.join(OUT_ROOT, "master_metrics.csv")
+
+if not os.path.exists(CSV):
+    sys.exit(f"ERROR: master_metrics.csv not found: {CSV}")
+
+df = pd.read_csv(CSV)
+if "Sample" not in df.columns or "BUSCO_Complete" not in df.columns:
+    sys.exit("ERROR: Required columns 'Sample' and 'BUSCO_Complete' missing in master_metrics.csv")
+
+df_nonan = df.dropna(subset=["BUSCO_Complete"])
+if df_nonan.empty:
+    sys.exit("ERROR: No samples with BUSCO_Complete values found.")
+
+top6 = df_nonan.sort_values("BUSCO_Complete", ascending=False).head(6)
+
+os.makedirs(COA_DIR, exist_ok=True)
+rank_txt = os.path.join(COA_DIR, "top6_samples.txt")
+rank_csv = os.path.join(COA_DIR, "top6_ranked_samples.csv")
+
+top6["Sample"].to_csv(rank_txt, index=False, header=False)
+top6.to_csv(rank_csv, index=False)
+print("Top-6 samples by BUSCO_Complete:\n", top6[["Sample","BUSCO_Complete"]])
+
+# copy trimmed reads into co-assembly/top_samples/<sample>/
+os.makedirs(TOP_DIR, exist_ok=True)
+for sample in top6["Sample"]:
+    sdir = os.path.join(OUT_ROOT, f"{sample}_out")
+    if not os.path.isdir(sdir):
+        print(f"WARNING: {sdir} not found; skipping")
+        continue
+    dest = os.path.join(TOP_DIR, sample)
+    os.makedirs(dest, exist_ok=True)
+    found = 0
+    for suffix in ["_R1.fastq.gz", "_R2.fastq.gz"]:
+        target_name = f"trimmed{suffix}"
+        for cand in [
+            os.path.join(sdir, "raw_outputs", "fastp", target_name),
+            os.path.join(sdir, target_name),
+        ]:
+            if os.path.exists(cand):
+                shutil.copy2(cand, os.path.join(dest, os.path.basename(cand)))
+                print(f"Copied {os.path.basename(cand)} -> {dest}")
+                found += 1
+                break
+    if found < 2:
+        print(f"WARNING: missing one or more trimmed reads for {sample}")
+PY_SELECT
+deactivate
+
+# =========================
+# Step 2: Sequential co-assembly function (no per-assembly graphs/reports)
+# =========================
+run_seq_coassembly() {
+  local K="$1" LABEL="$2"
+  local OUT_DIR="$SEQ_DIR/$LABEL"
+  mkdir -p "$OUT_DIR"
+
+  # Build sample list (top K)
+  mapfile -t SAMPLES < <(head -n "$K" "$COA_DIR/top6_samples.txt")
+
+  # Collect reads
+  local R1_LIST=() R2_LIST=()
+  for s in "${SAMPLES[@]}"; do
+    local R1="$TOP_DIR/$s/trimmed_R1.fastq.gz"
+    local R2="$TOP_DIR/$s/trimmed_R2.fastq.gz"
+    [ -f "$R1" ] || { echo "Missing $R1"; exit 1; }
+    [ -f "$R2" ] || { echo "Missing $R2"; exit 1; }
+    R1_LIST+=("$R1"); R2_LIST+=("$R2")
+  done
+
+  # Combine reads
+  zcat "${R1_LIST[@]}" | gzip > "$OUT_DIR/R1_combined.fastq.gz"
+  zcat "${R2_LIST[@]}" | gzip > "$OUT_DIR/R2_combined.fastq.gz"
+
+  # ---------- SPAdes (single-cell mode) ----------
+  spades.py --sc \
+    -1 "$OUT_DIR/R1_combined.fastq.gz" \
+    -2 "$OUT_DIR/R2_combined.fastq.gz" \
+    -o "$OUT_DIR/spades_out" \
+    --threads "$THREADS" --memory 64 \
+    > "$OUT_DIR/spades.log" 2>&1
+
+  local ASSEMBLY="$OUT_DIR/spades_out/contigs.fasta"
+
+  # ---------- Kraken2 ----------
+  singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
+    --db "$DB_DIR" \
+    --report "$OUT_DIR/kraken_report.txt" \
+    --paired "$OUT_DIR/R1_combined.fastq.gz" "$OUT_DIR/R2_combined.fastq.gz" \
+    --threads "$THREADS" \
+    > "$OUT_DIR/kraken_output.txt" 2>&1
+
+  # ---------- BWA/Samtools ----------
+  singularity exec "$SIF_DIR/bwa.sif" bwa index "$ASSEMBLY"
+  singularity exec "$SIF_DIR/bwa.sif" bwa mem -t "$THREADS" \
+    "$ASSEMBLY" "$OUT_DIR/R1_combined.fastq.gz" "$OUT_DIR/R2_combined.fastq.gz" \
+    | singularity exec "$SIF_DIR/samtools.sif" samtools view -bS - \
+    > "$OUT_DIR/mapped.bam"
+
+  singularity exec "$SIF_DIR/samtools.sif" samtools sort -@ "$THREADS" \
+    -o "$OUT_DIR/mapped.sorted.bam" "$OUT_DIR/mapped.bam"
+
+  singularity exec "$SIF_DIR/samtools.sif" samtools index "$OUT_DIR/mapped.sorted.bam"
+
+  singularity exec "$SIF_DIR/samtools.sif" samtools depth -a "$OUT_DIR/mapped.sorted.bam" > "$OUT_DIR/depth.txt"
+
+  # ---------- Pilon ----------
+  singularity exec "$SIF_DIR/pilon.sif" java -Xmx60G -jar /pilon/pilon.jar \
+    --genome "$ASSEMBLY" \
+    --frags "$OUT_DIR/mapped.sorted.bam" \
+    --output "$OUT_DIR/pilon_corrected" \
+    --threads "$THREADS" \
+    > "$OUT_DIR/pilon.log" 2>&1
+
+  local PILON_ASSEMBLY="$OUT_DIR/pilon_corrected.fasta"
+
+  # ---------- Contig filtering (>= 1000 bp, seqkit SIF if available) ----------
+  local FILTERED_ASSEMBLY="$PILON_ASSEMBLY"
+  local SEQKIT_SIF="$SIF_DIR/seqkit.sif"
+
+  if [ -f "$SEQKIT_SIF" ]; then
+    echo "[coassembly-$LABEL] Filtering contigs < 1000 bp using seqkit..."
+    singularity exec "$SEQKIT_SIF" seqkit seq -m 1000 "$PILON_ASSEMBLY" > "$OUT_DIR/pilon_corrected.1kb.fasta"
+    FILTERED_ASSEMBLY="$OUT_DIR/pilon_corrected.1kb.fasta"
+  else
+    echo "[coassembly-$LABEL] Seqkit SIF not found at $SEQKIT_SIF — skipping contig length filter."
+  fi
+
+  # ---------- BUSCO (on polished, filtered assembly) ----------
+  export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 MKL_NUM_THREADS=1
+  local TS; TS=$(date +%Y%m%d%H%M%S)
+  local BUSCO_RUN="busco_${LABEL}_${TS}"
+  local BUSCO_LOG="$OUT_DIR/${BUSCO_RUN}.log"
+
+  singularity exec -B "$OUT_DIR:$OUT_DIR" "$SIF_DIR/busco_v6.0.0_cv1.sif" \
+    busco -i "$FILTERED_ASSEMBLY" -o "$BUSCO_RUN" -l "$BUSCO_LINEAGE" -m genome --cpu 2 --out_path "$OUT_DIR" \
+    > "$BUSCO_LOG" 2>&1
+
+  # ---------- Sourmash ----------
+  local SM_OUT="$OUT_DIR/contamination_checks/sourmash"
+  mkdir -p "$SM_OUT"
+  singularity exec "$SIF_DIR/sourmash.sif" sourmash sketch dna -p k=21,scaled=1000 \
+    -o "$SM_OUT/assembly.sig" "$FILTERED_ASSEMBLY"
+  singularity exec "$SIF_DIR/sourmash.sif" sourmash gather \
+    "$SM_OUT/assembly.sig" "$SM_DB" \
+    -o "$SM_OUT/gather_results.csv"
+
+  echo "[coassembly-$LABEL] Finished co-assembly K=$K (OUT_DIR=$OUT_DIR)"
+}
+
+# =========================
+# Step 3: Run sequential co-assemblies (2→6)
+# =========================
+run_seq_coassembly 2 double
+run_seq_coassembly 3 triple
+run_seq_coassembly 4 quadruple
+run_seq_coassembly 5 pentuple
+run_seq_coassembly 6 sextuple
+
+# =========================
+# Step 4: BUSCO completeness trend plot (Complete + Fragmented)
+# =========================
+source "$SHARED_VENV/bin/activate"
+python3 - << 'PY_TREND'
+import os, re, glob
+import numpy as np
+import matplotlib.pyplot as plt
+
+OUT_ROOT = os.path.expanduser(os.environ.get("OUT_ROOT","~/Enhanced_Pipeline_10_out"))
+COA_DIR  = os.path.join(OUT_ROOT, "co-assembly")
+SEQ_DIR  = os.path.join(COA_DIR, "sequential_assemblies")
+
+labels = [("double",2),("triple",3),("quadruple",4),("pentuple",5),("sextuple",6)]
+
+x = []
+complete = []
+fragmented = []
+
+for lbl,k in labels:
+    outdir = os.path.join(SEQ_DIR,lbl)
+    logs = sorted(
+        glob.glob(os.path.join(outdir,"logs","busco_*.log")) +
+        glob.glob(os.path.join(outdir,"busco_*.log")),
+        key=os.path.getmtime, reverse=True
+    )
+    comp, frag = np.nan, np.nan
+    for lg in logs:
+        for line in open(lg, encoding='utf-8', errors='ignore'):
+            m = re.search(r"C:(\d+\.\d+)%.*F:(\d+\.\d+)%", line)
+            if m:
+                comp, frag = float(m.group(1)), float(m.group(2))
+                break
+        if not np.isnan(comp):
+            break
+    x.append(k)
+    complete.append(comp)
+    fragmented.append(frag)
+
+blue = "#0072BC"
+yellow = "#FFC740"
+
+plt.figure(figsize=(8,5))
+plt.scatter(x, complete, color=blue, label='Complete', s=100, marker='o')
+plt.plot(x, complete, color=blue, linestyle='--', alpha=0.7)
+for xi, yi in zip(x, complete):
+    if not np.isnan(yi):
+        plt.text(xi, yi + 1, f"{yi:.1f}%", ha='center', va='bottom', fontsize=9, color='black')
+
+plt.scatter(x, fragmented, color=yellow, label='Fragmented', s=100, marker='^')
+plt.plot(x, fragmented, color=yellow, linestyle='--', alpha=0.7)
+for xi, yi in zip(x, fragmented):
+    if not np.isnan(yi):
+        plt.text(xi, yi - 2, f"{yi:.1f}%", ha='center', va='top', fontsize=9, color='black')
+
+plt.xticks(x, ["Double","Triple","Quadruple","Pentuple","Sextuple"])
+plt.xlabel("Number of SAGs in co-assembly")
+plt.ylabel("BUSCO %")
+plt.title("BUSCO completeness across co-assemblies")
+plt.ylim(0, 105)
+plt.grid(axis='y', linestyle='--', alpha=0.5)
+plt.legend()
+plt.tight_layout()
+
+out_png = os.path.join(COA_DIR, "sequential_results.png")
+plt.savefig(out_png, dpi=300, bbox_inches="tight")
+print(f"Saved BUSCO line plot: {out_png}")
+PY_TREND
+deactivate || true
+
+echo "Sequential co-assembly workflow complete."
