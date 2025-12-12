@@ -1,5 +1,5 @@
 #!/bin/bash
-#$ -N NewPipelineCNTWDeep1
+#$ -N NewPipelineCNTWDeep2
 #$ -cwd
 #$ -l h_rt=120:00:00
 #$ -l s_vmem=16G,mem_req=16G
@@ -127,12 +127,15 @@ for R1 in "$DATA_DIR"/*_R1_001.fastq.gz; do
   ASSEMBLY="$OUT_DIR/spades_out/contigs.fasta"
 
   # ---------- 3. Kraken2 ----------
+  KRAKEN_DIR="$OUT_DIR/contamination_checks/kraken"
+  mkdir -p "$KRAKEN_DIR"
+
   singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
     --db "$DB_DIR" \
-    --report "$OUT_DIR/kraken_report.txt" \
-    --paired "$OUT_DIR/trimmed_R1.fastq.gz" "$OUT_DIR/trimmed_R2.fastq.gz" \
+    --report "$KRAKEN_DIR/kraken_report.txt" \
+    --paired "$R1_CLEAN" "$R2_CLEAN" \
     --threads "$NSLOTS" \
-    > "$OUT_DIR/kraken_output.txt" 2>&1
+    > "$KRAKEN_DIR/kraken_output.txt" 2>&1
 
   # ---------- 4. BWA/Samtools ----------
   singularity exec "$SIF_DIR/bwa.sif" bwa index "$ASSEMBLY"
@@ -355,8 +358,8 @@ if depth_path and os.path.exists(depth_path):
     except Exception:
         pass
 
-# ---------- Kraken top 5 ----------
-krep = os.path.join(OUT_DIR, "kraken_report.txt")
+# ---------- Kraken top 5 (SPECIES only) ----------
+krep = os.path.join(OUT_DIR, "contamination_checks", "kraken", "kraken_report.txt")
 kraken_top = []
 if os.path.exists(krep):
     try:
@@ -365,11 +368,62 @@ if os.path.exists(krep):
             names=["perc","reads","tax_reads","rank","taxid","name"]
         )
         kdf["name"] = kdf["name"].astype(str).str.strip()
-        top = kdf.sort_values("perc", ascending=False).head(5)
+
+        # Species only
+        sdf = kdf[kdf["rank"] == "S"].copy()
+        sdf = sdf.sort_values("perc", ascending=False)
+
+        top = sdf.head(5)
         for _, r in top.iterrows():
             kraken_top.append((r["name"], float(r["perc"])))
+
+        # Per-sample long table (for heatmaps; top 50 species)
+        kraken_long_path = os.path.join(
+            OUT_DIR, "contamination_checks", "kraken", "kraken_species_long.csv"
+        )
+        os.makedirs(os.path.dirname(kraken_long_path), exist_ok=True)
+        out = sdf.head(50)[["name","perc","reads","tax_reads","taxid"]].copy()
+        out.insert(0, "Sample", SAMPLE)
+        out.to_csv(kraken_long_path, index=False)
+
     except Exception:
         pass
+# ---------- Sourmash gather long table for heatmaps ----------
+sm_gather = os.path.join(
+    OUT_DIR, "contamination_checks", "sourmash", "gather_results.csv"
+)
+sm_long_path = os.path.join(
+    OUT_DIR, "contamination_checks", "sourmash", "sourmash_gather_long.csv"
+)
+
+def pick_sourmash_metric(df):
+    for c in ["f_match", "f_unique_to_query", "f_unique_weighted", "f_query_match"]:
+        if c in df.columns:
+            return c
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return None
+
+if os.path.exists(sm_gather):
+    try:
+        sdf = pd.read_csv(sm_gather)
+        metric = pick_sourmash_metric(sdf)
+        name_col = (
+            "name" if "name" in sdf.columns
+            else ("match_name" if "match_name" in sdf.columns else None)
+        )
+
+        if metric and name_col:
+            out = sdf[[name_col, metric]].copy()
+            out.rename(columns={name_col: "match", metric: "value"}, inplace=True)
+            out.insert(0, "Sample", SAMPLE)
+            out = out.sort_values("value", ascending=False).head(50)
+            os.makedirs(os.path.dirname(sm_long_path), exist_ok=True)
+            out.to_csv(sm_long_path, index=False)
+    except Exception:
+        pass
+
 
 # ---------- write per-sample kraken_top5.csv ----------
 if kraken_top:
@@ -491,8 +545,9 @@ if ddf is not None:
 # 5. Kraken top taxa
 kr_csv = os.path.join(dirs["Kraken"], f"{SAMPLE}_kraken_top10.csv")
 if kdf is not None:
-    kdf_sorted = kdf.sort_values("perc", ascending=False).head(10)
-    kdf_sorted[["name", "perc"]].to_csv(kr_csv, index=False)
+    sdf10 = kdf[kdf["rank"] == "S"].copy().sort_values("perc", ascending=False).head(10)
+    sdf10[["name", "perc"]].to_csv(kr_csv, index=False)
+
 
 # 6. Clean Size vs BUSCO completeness
 csb_csv = os.path.join(dirs["CleanSize_vs_BUSCO"], f"{SAMPLE}_cleanSize_busco.csv")
@@ -550,39 +605,65 @@ if not np.isnan(depth_mean):
     lines.append(f"Mean coverage      : {depth_mean:.1f}×")
 if not np.isnan(depth_median):
     lines.append(f"Median coverage    : {depth_median:.1f}×")
-lines.append("BAM                : raw_outputs/mapping/mapped.sorted.bam")
-lines.append("Depth table        : raw_outputs/mapping/depth.txt")
+lines.append(f"BAM                : {os.path.join(OUT_DIR, 'mapped.sorted.bam')}")
+lines.append(f"Depth table        : {os.path.join(OUT_DIR, 'depth.txt')}")
+
 
 lines.append("")
-lines.append("== Kraken2 top taxa ==")
+lines.append("== Kraken2 top species (rank=S) ==")
 if kraken_top:
     for name, perc in kraken_top:
         lines.append(f"{name:30s} {perc:5.1f}%")
 else:
-    lines.append("No Kraken2 report / no taxa.")
+        lines.append("No species-level hits in Kraken report (rank=S).")
 
 lines.append("")
 lines.append("== Other outputs ==")
-lines.append("Pilon assembly     : raw_outputs/pilon/pilon_corrected.fasta")
-lines.append("Sourmash           : raw_outputs/sourmash/assembly.sig, gather_results.csv")
+lines.append(f"Pilon assembly     : {os.path.join(OUT_DIR, 'pilon_corrected.fasta')}")
+lines.append(f"Kraken report      : {os.path.join(OUT_DIR, 'contamination_checks', 'kraken', 'kraken_report.txt')}")
+lines.append(f"Sourmash           : {os.path.join(OUT_DIR, 'contamination_checks', 'sourmash', 'assembly.sig')}, {os.path.join(OUT_DIR, 'contamination_checks', 'sourmash', 'gather_results.csv')}")
 
 summary_txt_path = os.path.join(OUT_DIR, "summary.txt")
 with open(summary_txt_path, "w", encoding="utf-8") as w:
     w.write("\n".join(lines))
 
 # ---------- turn summary.txt into a 1-page PDF (text only) ----------
+import textwrap
+
 summary_pdf = os.path.join(OUT_DIR, "sample_report.pdf")
-text = "\n".join(lines)
+
+# Wrap lines so they don't spill off the page
+wrapped_lines = []
+for ln in lines:
+    if ln.strip() == "":
+        wrapped_lines.append("")
+    else:
+        wrapped_lines.extend(
+            textwrap.wrap(
+                ln, width=95,
+                break_long_words=False,
+                break_on_hyphens=False
+            )
+        )
+text = "\n".join(wrapped_lines)
 
 fig, ax = plt.subplots(figsize=(8.5, 11))
 ax.axis("off")
-if FONT:
-    ax.text(0.06, 0.96, text, va="top", ha="left",
-            fontproperties=FONT, fontsize=10, linespacing=1.2)
-else:
-    ax.text(0.06, 0.96, text, va="top", ha="left",
-            family="monospace", fontsize=9, linespacing=1.2)
-fig.tight_layout()
+
+# Force normal (not bold/italic) and use a stable mono font
+ax.text(
+    0.05, 0.97, text,
+    va="top", ha="left",
+    transform=ax.transAxes,
+    fontsize=9.5,
+    linespacing=1.35,
+    fontstyle="normal",
+    fontweight="normal",
+    family="monospace"
+)
+
+# Explicit margins (prevents tight_layout squeezing)
+fig.subplots_adjust(left=0.03, right=0.97, top=0.98, bottom=0.03)
 fig.savefig(summary_pdf, dpi=300)
 plt.close(fig)
 
@@ -593,6 +674,127 @@ print(f"[{SAMPLE}] master_metrics.csv -> {master_path} (append)")
 PY_PER_SAMPLE
   deactivate
 done
+
+# =========================
+# GLOBAL HEATMAP MATRICES + CONTAMINATION SUMMARY
+# =========================
+source "$SHARED_VENV/bin/activate"
+python3 - << 'PY_HEATMAPS'
+import os, glob
+import pandas as pd
+
+OUT_ROOT = os.path.expanduser(os.environ["OUT_ROOT"])
+
+def build_matrix(long_files, sample_col, taxa_col, value_col, out_prefix, topN=50):
+    if not long_files:
+        print(f"[{out_prefix}] No input files found; skipping.")
+        return None, None
+
+    long = pd.concat((pd.read_csv(f) for f in long_files), ignore_index=True)
+    long[value_col] = pd.to_numeric(long[value_col], errors="coerce").fillna(0.0)
+
+    top_taxa = (
+        long.groupby(taxa_col)[value_col]
+            .mean()
+            .sort_values(ascending=False)
+            .head(topN)
+            .index
+            .tolist()
+    )
+    long_top = long[long[taxa_col].isin(top_taxa)].copy()
+
+    wide = long_top.pivot_table(
+        index=sample_col, columns=taxa_col, values=value_col,
+        aggfunc="max", fill_value=0.0
+    )
+
+    long_path = os.path.join(OUT_ROOT, f"{out_prefix}_long_all.csv")
+    wide_path = os.path.join(OUT_ROOT, f"{out_prefix}_heatmap_matrix_top{topN}.csv")
+    long.to_csv(long_path, index=False)
+    wide.to_csv(wide_path)
+
+    print(f"[{out_prefix}] wrote: {long_path}")
+    print(f"[{out_prefix}] wrote: {wide_path}")
+    return long, wide
+
+# Kraken species (% reads)
+kraken_files = glob.glob(os.path.join(
+    OUT_ROOT, "*_out", "contamination_checks", "kraken", "kraken_species_long.csv"
+))
+kraken_long, _ = build_matrix(
+    kraken_files, "Sample", "name", "perc", "kraken_species", topN=50
+)
+
+# Sourmash gather (fraction-ish)
+sm_files = glob.glob(os.path.join(
+    OUT_ROOT, "*_out", "contamination_checks", "sourmash", "sourmash_gather_long.csv"
+))
+sm_long, _ = build_matrix(
+    sm_files, "Sample", "match", "value", "sourmash_gather", topN=50
+)
+
+# ----- Contamination summary (one row per sample) -----
+rows = []
+# Use master_metrics.csv if present to pull BUSCO/assembly size, etc.
+master_csv = os.path.join(OUT_ROOT, "master_metrics.csv")
+master = None
+if os.path.exists(master_csv):
+    try:
+        master = pd.read_csv(master_csv)
+    except Exception:
+        master = None
+
+samples = sorted({os.path.basename(p).replace("_out","") for p in glob.glob(os.path.join(OUT_ROOT, "*_out"))})
+
+for s in samples:
+    row = {"Sample": s}
+
+    # Top Kraken species + %
+    k_path = os.path.join(OUT_ROOT, f"{s}_out", "contamination_checks", "kraken", "kraken_species_long.csv")
+    if os.path.exists(k_path):
+        kdf = pd.read_csv(k_path)
+        if not kdf.empty:
+            kdf2 = kdf.sort_values("perc", ascending=False)
+            row["Top_Kraken_Species"] = str(kdf2.iloc[0]["name"])
+            row["Top_Kraken_%Reads"]  = float(kdf2.iloc[0]["perc"])
+        else:
+            row["Top_Kraken_Species"] = ""
+            row["Top_Kraken_%Reads"]  = 0.0
+    else:
+        row["Top_Kraken_Species"] = ""
+        row["Top_Kraken_%Reads"]  = 0.0
+
+    # Top Sourmash match + value
+    sm_path = os.path.join(OUT_ROOT, f"{s}_out", "contamination_checks", "sourmash", "sourmash_gather_long.csv")
+    if os.path.exists(sm_path):
+        sdf = pd.read_csv(sm_path)
+        if not sdf.empty:
+            sdf2 = sdf.sort_values("value", ascending=False)
+            row["Top_Sourmash_Match"] = str(sdf2.iloc[0]["match"])
+            row["Top_Sourmash_Value"] = float(sdf2.iloc[0]["value"])
+        else:
+            row["Top_Sourmash_Match"] = ""
+            row["Top_Sourmash_Value"] = 0.0
+    else:
+        row["Top_Sourmash_Match"] = ""
+        row["Top_Sourmash_Value"] = 0.0
+
+    # Pull extra metrics from master_metrics.csv if available
+    if master is not None and "Sample" in master.columns:
+        m = master[master["Sample"] == s]
+        if not m.empty:
+            for col in ["BUSCO_Complete", "TotalLength_bp", "N50_bp", "NumContigs", "Depth_mean", "Fastp_Q30_rate"]:
+                if col in m.columns:
+                    row[col] = m.iloc[-1][col]
+
+    rows.append(row)
+
+out = pd.DataFrame(rows)
+out_path = os.path.join(OUT_ROOT, "contamination_summary.csv")
+out.to_csv(out_path, index=False)
+print("Wrote contamination summary:", out_path)
+PY_HEATMAPS
+deactivate || true
 
 # =========================================
 # CO-ASSEMBLY (sequential) SECTION
@@ -703,12 +905,15 @@ run_seq_coassembly() {
   local ASSEMBLY="$OUT_DIR/spades_out/contigs.fasta"
 
   # ---------- Kraken2 ----------
+  local KRAKEN_DIR="$OUT_DIR/contamination_checks/kraken"
+  mkdir -p "$KRAKEN_DIR"
+
   singularity exec "$SIF_DIR/kraken2.sif" kraken2 \
     --db "$DB_DIR" \
-    --report "$OUT_DIR/kraken_report.txt" \
+    --report "$KRAKEN_DIR/kraken_report.txt" \
     --paired "$OUT_DIR/R1_combined.fastq.gz" "$OUT_DIR/R2_combined.fastq.gz" \
     --threads "$THREADS" \
-    > "$OUT_DIR/kraken_output.txt" 2>&1
+    > "$KRAKEN_DIR/kraken_output.txt" 2>&1
 
   # ---------- BWA/Samtools ----------
   singularity exec "$SIF_DIR/bwa.sif" bwa index "$ASSEMBLY"
