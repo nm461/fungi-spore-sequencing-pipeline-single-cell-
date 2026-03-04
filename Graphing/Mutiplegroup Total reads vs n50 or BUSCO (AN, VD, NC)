@@ -1,0 +1,191 @@
+library(ggplot2)
+library(readxl)
+library(scales)
+
+# ===============================
+# SETTINGS
+# ===============================
+infile <- "ANsingleN50.xlsx"
+
+outfile_png <- "plot.png"
+outfile_pdf <- "plot.pdf"
+
+# Style knobs (apply to BOTH BUSCO + N50)
+line_col <- "black"
+line_lw  <- 0.14   # box + tick thickness
+pt_size  <- 2.0
+lm_lw    <- 0.7
+ann_size <- 3.0
+
+# Nudge annotation slightly left/up (safe; doesn't exceed BUSCO limit)
+ANN_X_MULT <- 1.03   # inset from left (log-x) before left-nudge
+ANN_LEFT   <- 0.97   # additional left nudge
+ANN_BUSCO_Y <- 49.5  # keep inside 0–50
+
+# Colors
+cols <- c(
+  AN = "#0070C0",  # dark blue
+  VD = "#C00000",  # dark red
+  NC = "#FFBF00"   # amber
+)
+
+# ===============================
+# READ DATA
+# ===============================
+df <- read_excel(infile)
+names(df) <- trimws(names(df))
+
+required <- c("Total_reads", "Sample")
+missing_cols <- setdiff(required, names(df))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing column(s):", paste(missing_cols, collapse = ", ")))
+}
+
+# ===============================
+# AUTO METRIC DETECTION (by column name)
+# ===============================
+if ("BUSCO" %in% names(df)) {
+
+  metric_col <- "BUSCO"
+  y_label <- "BUSCO Marker Genes (%)"
+  plot_title <- "BUSCO Completeness vs Total Reads"
+  Y_LOG <- FALSE
+  BUSCO_MODE <- TRUE
+
+} else if ("N50" %in% names(df)) {
+
+  metric_col <- "N50"
+  y_label <- "N50 Length (bp)"
+  plot_title <- "N50 Length vs Total Reads"
+  Y_LOG <- TRUE
+  BUSCO_MODE <- FALSE
+
+} else {
+  stop("Excel must contain column named BUSCO or N50")
+}
+
+# ===============================
+# CLEAN DATA
+# ===============================
+df$X <- as.numeric(df$Total_reads)
+df$Y <- as.numeric(df[[metric_col]])
+df$Group <- factor(df$Sample, levels = c("AN", "VD", "NC"))
+
+df <- df[is.finite(df$X) & df$X > 0 & is.finite(df$Y), ]
+if (Y_LOG) df <- df[df$Y > 0, ]
+
+# ===============================
+# PEARSON CORRELATION (per group)
+# ===============================
+calc_r <- function(d) {
+  d <- d[is.finite(d$X) & d$X > 0 & is.finite(d$Y), ]
+  if (Y_LOG) d <- d[is.finite(d$Y) & d$Y > 0, ]
+  if (nrow(d) < 3) return(NA_real_)
+  x <- log10(d$X)
+  y <- if (Y_LOG) log10(d$Y) else d$Y
+  cor(x, y, method = "pearson")
+}
+
+rs <- tapply(seq_len(nrow(df)), df$Group, function(i) calc_r(df[i, ]))
+
+annotation_text <- paste0(
+  "Pearson r (log10X", if (Y_LOG) "/log10Y" else "", ")\n",
+  paste(sprintf("%s = %.3f", names(rs), as.numeric(rs)), collapse = "\n")
+)
+
+# ===============================
+# ANNOTATION POSITION (no Inf; safe on log + BUSCO limits)
+# ===============================
+x_anno <- min(df$X, na.rm = TRUE) * ANN_X_MULT
+x_anno <- x_anno * ANN_LEFT
+
+if (BUSCO_MODE) {
+  y_anno <- ANN_BUSCO_Y           # always inside 0–50
+} else {
+  y_anno <- max(df$Y, na.rm = TRUE) * 0.98
+}
+
+# ===============================
+# PLOT
+# ===============================
+p <- ggplot(df, aes(x = X, y = Y, color = Group)) +
+
+  geom_point(size = pt_size, alpha = 0.95) +
+
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = FALSE,
+    linewidth = lm_lw,
+    linetype = "dashed"
+  ) +
+
+  scale_x_log10() +
+
+  (
+    if (BUSCO_MODE)
+      scale_y_continuous(
+        limits = c(0, 50),
+        labels = percent_format(scale = 1)
+      )
+    else if (Y_LOG)
+      scale_y_log10()
+    else
+      scale_y_continuous()
+  ) +
+
+  scale_color_manual(values = cols) +
+
+  labs(
+    title = plot_title,
+    x = "Total Reads",
+    y = y_label
+  ) +
+
+  annotate(
+    "text",
+    x = x_anno,
+    y = y_anno,
+    hjust = 0,
+    vjust = 1,
+    size = ann_size,
+    label = annotation_text,
+    color = "black"
+  ) +
+
+  # ---- unified styling for BOTH BUSCO and N50 ----
+  theme_classic(base_size = 13) +
+  theme(
+    # subtle dotted grid (both major + minor)
+    panel.grid.major = element_line(colour = "grey85", linewidth = 0.3, linetype = "dotted"),
+    panel.grid.minor = element_line(colour = "grey92", linewidth = 0.25, linetype = "dotted"),
+
+    # ONE box line style everywhere
+    panel.border = element_rect(colour = line_col, fill = NA, linewidth = line_lw),
+
+    # remove axis lines (prevents mismatch/doubling with the border)
+    axis.line = element_blank(),
+
+    # keep ticks and match them to box
+    axis.ticks = element_line(colour = line_col, linewidth = line_lw),
+
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+
+    axis.title.x = element_text(face = "bold", margin = margin(t = 10)),
+    axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
+    axis.text = element_text(color = "black"),
+
+    # legend inside top-right
+    legend.position = c(0.985, 0.985),
+    legend.justification = c(1, 1),
+    legend.background = element_blank(),
+    legend.title = element_blank()
+  )
+
+# ===============================
+# SAVE
+# ===============================
+ggsave(outfile_png, p, width = 7, height = 4.3, dpi = 300)
+ggsave(outfile_pdf, p, width = 7, height = 4.3, device = cairo_pdf)
+
+cat("Plot saved using metric:", metric_col, "\n")
