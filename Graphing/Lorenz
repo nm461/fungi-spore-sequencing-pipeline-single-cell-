@@ -1,0 +1,143 @@
+#!/usr/bin/env Rscript
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 1) {
+  stop("Usage: Rscript make_lorenz_VD_red.R masterLorenztable.csv [out_prefix]\n",
+       "Example: Rscript make_lorenz_VD_red.R masterLorenztable.csv lorenz_VD_red")
+}
+input_file <- args[1]
+out_prefix <- ifelse(length(args) >= 2, args[2], "coverage_uniformity_VD")
+
+# ---- Packages (auto-install) ----
+required_pkgs <- c("ggplot2","dplyr","readr","scales","tidyr")
+to_install <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) {
+  message("Installing missing packages: ", paste(to_install, collapse = ", "))
+  install.packages(to_install, repos="https://cloud.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(readr); library(scales); library(tidyr)
+})
+
+# ===============================
+# STYLE SETTINGS
+# ===============================
+line_col <- "black"
+line_lw  <- 0.14
+title_sz <- 14
+base_sz  <- 13
+
+# Dark -> light RED anchors
+red_anchors <- c(
+  "#7F0000",  # very dark red
+  "#A10000",
+  "#C00000",
+  "#D24A4A",
+  "#E27A7A",
+  "#F0A7A7",
+  "#F7CFCF"   # very light red
+)
+
+make_n_colors <- function(anchors, n) {
+  grDevices::colorRampPalette(anchors, space="Lab")(n)
+}
+
+# ===============================
+# FUNCTIONS
+# ===============================
+gini <- function(x) {
+  x <- x[is.finite(x) & x >= 0]
+  if (length(x) == 0) return(NA_real_)
+  if (sum(x) == 0) return(0)
+  x <- sort(x)
+  n <- length(x)
+  (2 * sum(seq_len(n) * x)) / (n * sum(x)) - (n + 1) / n
+}
+
+lorenz_df <- function(depths) {
+  d <- depths[is.finite(depths) & depths >= 0]
+  if (length(d) < 2 || sum(d) == 0) return(data.frame(p=c(0,1), L=c(0,1)))
+  d <- sort(d)
+  data.frame(p=c(0, seq_along(d)/length(d)), L=c(0, cumsum(d)/sum(d)))
+}
+
+# ===============================
+# READ DATA
+# ===============================
+df <- read_csv(input_file, show_col_types=FALSE)
+
+need <- c("Sample","mean_depth")
+miss <- setdiff(need, names(df))
+if (length(miss) > 0) stop("Missing required columns: ", paste(miss, collapse=", "))
+
+df <- df %>%
+  mutate(Sample=as.character(Sample), mean_depth=as.numeric(mean_depth)) %>%
+  filter(is.finite(mean_depth), mean_depth >= 0)
+
+if ("BinLabel" %in% names(df)) df <- df %>% filter(BinLabel == "10kb")
+
+# ---- Filter to VD samples ----
+df_vd <- df %>% filter(grepl("^VD", Sample))
+if (nrow(df_vd) == 0) stop("No VD samples found (expected Sample names starting with 'VD').")
+
+# ===============================
+# GINI RANKING (best -> worst)
+# ===============================
+gini_tbl <- df_vd %>%
+  group_by(Sample) %>%
+  summarise(Gini=gini(mean_depth), .groups="drop") %>%
+  arrange(Gini)
+
+write_csv(gini_tbl, paste0(out_prefix, "_gini_ranked.csv"))
+samples_by_quality <- gini_tbl$Sample
+
+pal <- make_n_colors(red_anchors, length(samples_by_quality))
+names(pal) <- samples_by_quality
+
+# ===============================
+# BUILD CURVES
+# ===============================
+curves <- df_vd %>%
+  group_by(Sample) %>%
+  summarise(curve=list(lorenz_df(mean_depth)), .groups="drop") %>%
+  unnest(curve) %>%
+  mutate(Sample=factor(Sample, levels=samples_by_quality))
+
+# ===============================
+# PLOT
+# ===============================
+p <- ggplot(curves, aes(x=p, y=L, group=Sample, color=Sample)) +
+  geom_line(linewidth=0.9, alpha=0.95) +
+  geom_abline(intercept=0, slope=1, linetype="dashed", linewidth=0.6, color="grey35") +
+  scale_color_manual(values=pal) +
+  scale_x_continuous(labels=percent_format(accuracy=1), limits=c(0,1), expand=c(0,0)) +
+  scale_y_continuous(labels=percent_format(accuracy=1), limits=c(0,1), expand=c(0,0)) +
+  labs(
+    title="Coverage uniformity (Lorenz curves) — VD",
+    x="Cumulative fraction of genome bins",
+    y="Cumulative fraction of total coverage",
+    color=NULL
+  ) +
+  theme_classic(base_size=base_sz) +
+  theme(
+    panel.grid.major = element_line(colour="grey85", linewidth=0.3, linetype="dotted"),
+    panel.grid.minor = element_line(colour="grey92", linewidth=0.25, linetype="dotted"),
+    panel.border = element_rect(colour=line_col, fill=NA, linewidth=line_lw),
+    axis.line = element_blank(),
+    axis.ticks = element_line(colour=line_col, linewidth=line_lw),
+    plot.title = element_text(face="bold", size=title_sz, hjust=0.5),
+    axis.title.x = element_text(face="bold", margin=margin(t=10)),
+    axis.title.y = element_text(face="bold", margin=margin(r=10)),
+    axis.text = element_text(color="black"),
+    legend.position="right",
+    legend.background=element_blank(),
+    legend.key=element_blank(),
+    legend.text=element_text(size=10)
+  ) +
+  guides(color = guide_legend(override.aes=list(linewidth=1.2, alpha=1)))
+
+# ===============================
+# SAVE
+# ===============================
+ggsave(paste0(out_prefix, "_lorenz_quality.png"), p, width=8.5, height=5.0, dpi=300)
+ggsave(paste0(out_prefix, "_lorenz_quality.pdf"), p, width=8.5, height=5.0, device=cairo_pdf)
