@@ -1,0 +1,54 @@
+#!/bin/bash
+#$ -N make_masterLorenztable
+#$ -cwd
+#$ -l h_rt=02:00:00
+#$ -l s_vmem=4G,mem_req=4G
+#$ -o $HOME/referencemappingtesting/AN_deep/logs/masterLorenztable.out
+#$ -e $HOME/referencemappingtesting/AN_deep/logs/masterLorenztable.err
+
+set -euo pipefail
+set -x
+
+# -------- USER SETTINGS --------
+MAP_ROOT="$HOME/referencemappingtesting/AN_deep/ReferenceMappingOut"
+OUT_CSV="$HOME/referencemappingtesting/AN_deep/ReferenceMappingOut/masterLorenztable.csv"
+
+# -------- sanity --------
+[ -d "$MAP_ROOT" ] || { echo "ERROR: MAP_ROOT not found: $MAP_ROOT" >&2; exit 1; }
+mkdir -p "$(dirname "$OUT_CSV")"
+
+# -------- write header --------
+# BinLabel is constant here (10kb). If you later want 50kb too, we can extend it.
+echo "Sample,BinLabel,contig,start,end,mean_depth,gc_frac" > "$OUT_CSV"
+
+found_any=0
+
+# Loop over sample directories explicitly
+for SDIR in "$MAP_ROOT"/AN_*; do
+  [ -d "$SDIR" ] || continue
+  SAMPLE="$(basename "$SDIR")"
+
+  F="$SDIR/bin_qc_10kb.tsv.gz"
+  if [ ! -f "$F" ]; then
+    echo "WARNING: missing $F (skipping $SAMPLE)" >&2
+    continue
+  fi
+
+  found_any=1
+  echo "INFO: adding $SAMPLE from $F" >&2
+
+  # Convert TSV.GZ -> CSV lines, skipping header row in each file
+  # Expected columns in TSV: contig start end len mean_depth gc_frac
+  # We output: Sample,BinLabel,contig,start,end,mean_depth,gc_frac
+  zcat "$F" \
+    | awk -v s="$SAMPLE" 'BEGIN{OFS=","} NR==1{next} {print s,"10kb",$1,$2,$3,$5,$6}' \
+    >> "$OUT_CSV"
+done
+
+if [ "$found_any" -eq 0 ]; then
+  echo "ERROR: No bin_qc_10kb.tsv.gz found under $MAP_ROOT/AN_*" >&2
+  exit 1
+fi
+
+echo "DONE. Wrote: $OUT_CSV" >&2
+echo "Rows (including header): $(wc -l < "$OUT_CSV")" >&2
