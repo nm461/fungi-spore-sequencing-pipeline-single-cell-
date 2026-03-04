@@ -1,0 +1,183 @@
+#!/usr/bin/env Rscript
+
+args <- commandArgs(trailingOnly = TRUE)
+
+if (length(args) < 2) {
+  stop("Usage: Rscript make_gini_barplot.R input.csv GROUP\n",
+       "Example: Rscript make_gini_barplot.R masterLorenztable.csv AN")
+}
+
+input_file <- args[1]
+group_type <- args[2]
+
+# ---- Packages ----
+required_pkgs <- c("ggplot2","dplyr","readr","scales")
+to_install <- setdiff(required_pkgs, rownames(installed.packages()))
+
+if (length(to_install) > 0) {
+  install.packages(to_install, repos="https://cloud.r-project.org")
+}
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(scales)
+
+# ===============================
+# STYLE SETTINGS
+# ===============================
+
+line_col <- "black"
+line_lw  <- 0.14
+title_sz <- 14
+base_sz  <- 13
+
+make_n_colors <- function(anchors, n) {
+  grDevices::colorRampPalette(anchors, space="Lab")(n)
+}
+
+# ===============================
+# COLOUR PALETTES
+# ===============================
+
+blue_anchors <- c(
+  "#0000FF","#1177DE","#448EE2",
+  "#65A1E6","#7CB0EA","#95BFEE","#AEcdf2"
+)
+
+red_anchors <- c(
+  "#7F0000","#A10000","#C00000",
+  "#D24A4A","#E27A7A","#F0A7A7","#F7CFCF"
+)
+
+amber_anchors <- c(
+  "#7A4A00","#9C5E00","#C47A00",
+  "#E69900","#F2B233","#F6C766","#F9DB99"
+)
+
+if (group_type == "AN") palette <- blue_anchors
+if (group_type == "NC") palette <- amber_anchors
+if (group_type == "VD") palette <- red_anchors
+
+# ===============================
+# GINI FUNCTION
+# ===============================
+
+gini <- function(x) {
+  x <- x[is.finite(x) & x >= 0]
+  if (length(x) == 0) return(NA_real_)
+  if (sum(x) == 0) return(0)
+
+  x <- sort(x)
+  n <- length(x)
+
+  (2 * sum(seq_len(n) * x)) / (n * sum(x)) - (n + 1) / n
+}
+
+# ===============================
+# READ DATA
+# ===============================
+
+df <- read_csv(input_file, show_col_types = FALSE)
+
+df <- df %>%
+  mutate(mean_depth = as.numeric(mean_depth)) %>%
+  filter(is.finite(mean_depth), mean_depth >= 0)
+
+if ("BinLabel" %in% names(df)) {
+  df <- df %>% filter(BinLabel == "10kb")
+}
+
+# remove AN_6 only for AN dataset
+if (group_type == "AN") {
+  df <- df %>% filter(Sample != "AN_6")
+}
+
+# ===============================
+# CALCULATE GINI
+# ===============================
+
+gini_tbl <- df %>%
+  group_by(Sample) %>%
+  summarise(Gini = gini(mean_depth), .groups="drop") %>%
+  arrange(Gini)
+
+# create colour gradient
+pal <- make_n_colors(palette, nrow(gini_tbl))
+names(pal) <- gini_tbl$Sample
+
+# ===============================
+# PLOT
+# ===============================
+
+p <- ggplot(gini_tbl,
+            aes(x = reorder(Sample, Gini),
+                y = Gini,
+                fill = Sample)) +
+
+  geom_col(width = 0.75) +
+
+  coord_flip() +
+
+  scale_fill_manual(values = pal) +
+
+  scale_y_continuous(
+    limits = c(0, max(gini_tbl$Gini)*1.05)
+  ) +
+
+  labs(
+    title = paste("Coverage inequality (Gini) —", group_type),
+    x = NULL,
+    y = "Gini coefficient (lower = more uniform)"
+  ) +
+
+  theme_classic(base_size = base_sz) +
+
+  theme(
+
+    panel.grid.major.x = element_line(
+      colour = "grey85",
+      linewidth = 0.3,
+      linetype = "dotted"
+    ),
+
+    panel.border = element_rect(
+      colour = line_col,
+      fill = NA,
+      linewidth = line_lw
+    ),
+
+    axis.line = element_blank(),
+
+    axis.ticks = element_line(
+      colour = line_col,
+      linewidth = line_lw
+    ),
+
+    plot.title = element_text(
+      face = "bold",
+      size = title_sz,
+      hjust = 0.5
+    ),
+
+    axis.title.y = element_text(
+      face = "bold",
+      margin = margin(r = 10)
+    ),
+
+    axis.text = element_text(color = "black"),
+
+    legend.position = "none"
+  )
+
+# ===============================
+# SAVE
+# ===============================
+
+outfile_png <- paste0(group_type, "_gini_barplot.png")
+outfile_pdf <- paste0(group_type, "_gini_barplot.pdf")
+
+ggsave(outfile_png, p, width = 8.5, height = 5, dpi = 300)
+ggsave(outfile_pdf, p, width = 8.5, height = 5, device = cairo_pdf)
+
+cat("Saved:", outfile_png, "\n")
